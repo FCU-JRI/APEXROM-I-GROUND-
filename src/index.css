@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+
+body {
+  background-color: #05060a;
+  color: #e0e0e0;
+  font-family: 'JetBrains Mono', monospace;
+  overflow: hidden;
+  height: 100vh;
+  margin: 0;
+}
+
+@theme {
+  --text-xs: 10px;
+  --text-sm: 12px;
+  --text-base: 16px;
+  --text-lg: 20px;
+}
+
+@layer utilities {
+  .glass-panel { background: rgba(15,20,30,0.85); border: 1px solid rgba(0,255,255,0.1); border-radius: 4px; position: relative; }
+  .glow-cyan   { box-shadow: 0 0 20px rgba(0,255,255,0.1); border-color: rgba(0,255,255,0.3); }
+  .text-neon   { color: #00ffcc; text-shadow: 0 0 8px rgba(0,255,204,0.4); }
+  .btn-base      { transition: all 0.2s; cursor: pointer; text-transform: uppercase; font-weight: bold; border-radius: 2px; }
+  .btn-sequence  { background: rgba(0,150,255,0.1);  border: 1px solid #0096ff; color: #0096ff; font-size: var(--text-sm); }
+  .btn-sequence:hover  { background: rgba(0,150,255,0.25);  box-shadow: 0 0 10px #0096ff; }
+  .btn-emergency { background: rgba(255,49,49,0.1);  border: 1px solid #ff3131; color: #ff3131; font-size: var(--text-sm); }
+  .btn-emergency:hover { background: rgba(255,49,49,0.3);   box-shadow: 0 0 15px #ff3131; }
+  .btn-warning   { background: rgba(255,204,0,0.1);  border: 1px solid #ffcc00; color: #ffcc00; font-size: var(--text-sm); }
+  .btn-warning:hover   { background: rgba(255,204,0,0.25);  box-shadow: 0 0 10px #ffcc00; }
+  .btn-debug     { background: rgba(130,130,130,0.1);border: 1px solid #888;    color: #888;    font-size: var(--text-sm); }
+  .btn-debug:hover     { background: rgba(130,130,130,0.2); }
+  .terminal-box  { height: 110px; background: #000; border: 1px solid #1a2a33; overflow-y: auto; font-size: var(--text-xs); line-height: 1.2; padding: 4px; }
+  .terminal-line { border-left: 2px solid #00ffcc; padding-left: 6px; margin-bottom: 2px; background: rgba(0,255,204,0.02); }
+  .scanline { width:100%; height:2px; background:linear-gradient(to bottom,transparent,rgba(0,255,255,0.05),transparent); position:absolute; top:0; left:0; animation:scan 8s linear infinite; pointer-events:none; z-index:100; }
+  @keyframes scan { 0%{top:0%} 100%{top:100%} }
+  .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+  .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,255,255,0.2); }
+}

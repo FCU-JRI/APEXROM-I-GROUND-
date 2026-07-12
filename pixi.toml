@@ -1,0 +1,21 @@
+[workspace]
+channels = ["conda-forge"]
+name = "P2026"
+platforms = ["osx-arm64", "win-64"]
+version = "0.1.0"
+
+[tasks]
+monitor = "python py_files/monitor.py"
+install-frontend = "npm install"
+frontend = "npm run dev"
+fullstack = "python start_all.py"
+build = "npm run build"
+prod = "python start_prod.py"
+
+[dependencies]
+python = ">=3.14.6,<3.15"
+pyserial = ">=3.5,<4"
+websockets = ">=16.0,<17"
+prompt_toolkit = ">=3.0.52,<4"
+nodejs = ">=26.5.0,<26.6"
+caddy = ">=2.11.4,<3"
