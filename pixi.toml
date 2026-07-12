@@ -7,10 +7,22 @@ version = "0.1.0"
 [tasks]
 monitor = "python py_files/monitor.py"
 install-frontend = "npm install"
-frontend = "npm run dev"
-fullstack = "python start_all.py"
-build = "npm run build"
-prod = "python start_prod.py"
+
+[tasks.frontend]
+cmd = "npm run dev"
+depends-on = ["install-frontend"]
+
+[tasks.fullstack]
+cmd = "python start_all.py"
+depends-on = ["install-frontend"]
+
+[tasks.build]
+cmd = "npm run build"
+depends-on = ["install-frontend"]
+
+[tasks.prod]
+cmd = "python start_prod.py"
+depends-on = ["build"]
 
 [dependencies]
 python = ">=3.14.6,<3.15"
