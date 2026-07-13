@@ -301,13 +301,14 @@ def main():
     global _ser_global
     serial_port = choose_serial_port()
     try:
-        ser = serial.Serial(serial_port, BAUD_RATE, timeout=1)
-        import time
-        ser.setDTR(False)
-        ser.setRTS(True)
-        time.sleep(0.1)
-        ser.setRTS(False)
-        time.sleep(0.1)
+        ser = serial.Serial()
+        ser.port = serial_port
+        ser.baudrate = BAUD_RATE
+        ser.timeout = 1
+        # 在 open 之前先設定好 DTR 和 RTS，避免一連線就觸發 ESP32 重新開機
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
         _ser_global = ser  # 讓 ws_handler 可存取 Serial port
         print(f"成功連接 {serial_port} @ {BAUD_RATE} baud.")
         
