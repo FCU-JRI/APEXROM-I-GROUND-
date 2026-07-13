@@ -242,10 +242,10 @@ def read_from_port(ser):
             if ser.in_waiting > 0:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 
-                if "Simulated Radio TX Data:" in line:
+                if "Wired Telemetry Data:" in line:
                     try:
                         print("\n==================== NEW LORA CHUNK ====================")
-                        hex_str = line.split("Simulated Radio TX Data:")[1].strip()
+                        hex_str = line.split("Wired Telemetry Data:")[1].strip()
                         hex_list = hex_str.split()
                         byte_data = bytes([int(x, 16) for x in hex_list])
                         rf_buffer.extend(byte_data)
