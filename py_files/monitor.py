@@ -159,14 +159,14 @@ def parse_rf_buffer():
             offset += 1
             
         elif pkt_type == 1: # DATA_TYPE_IMU
-            if len(rf_buffer) - offset < 26: break
-            ax, ay, az, gx, gy, gz, mx, my, mz = struct.unpack_from('<9h', rf_buffer, offset + 8)
-            ax, ay, az = clean_float(ax / 100.0), clean_float(ay / 100.0), clean_float(az / 100.0)
-            gx, gy, gz = clean_float(gx / 100.0), clean_float(gy / 100.0), clean_float(gz / 100.0)
-            mx, my, mz = clean_float(mx / 100.0), clean_float(my / 100.0), clean_float(mz / 100.0)
+            if len(rf_buffer) - offset < 44: break
+            ax, ay, az, gx, gy, gz, mx, my, mz = struct.unpack_from('<9f', rf_buffer, offset + 8)
+            ax, ay, az = clean_float(ax), clean_float(ay), clean_float(az)
+            gx, gy, gz = clean_float(gx), clean_float(gy), clean_float(gz)
+            mx, my, mz = clean_float(mx), clean_float(my), clean_float(mz)
             print(f"  🔹 [IMU] {ts}ms: Acc=({ax:.2f}, {ay:.2f}, {az:.2f}) Gyro=({gx:.2f}, {gy:.2f}, {gz:.2f}) Mag=({mx:.2f}, {my:.2f}, {mz:.2f})")
             batch_data.append({"type": "IMU", "ts": ts, "data": {"ax":ax, "ay":ay, "az":az, "gx":gx, "gy":gy, "gz":gz, "mx":mx, "my":my, "mz":mz}})
-            offset += 26
+            offset += 44
             parsed_count += 1
             
         elif pkt_type == 2: # DATA_TYPE_BMP
