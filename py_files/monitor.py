@@ -168,6 +168,17 @@ def parse_rf_buffer():
             offset += 32
             parsed_count += 1
             
+        elif pkt_type == 5: # DATA_TYPE_IMU_MAG
+            if len(rf_buffer) - offset < 44: break
+            ax, ay, az, gx, gy, gz, mx, my, mz = struct.unpack_from('<9f', rf_buffer, offset + 8)
+            ax, ay, az = clean_float(ax), clean_float(ay), clean_float(az)
+            gx, gy, gz = clean_float(gx), clean_float(gy), clean_float(gz)
+            mx, my, mz = clean_float(mx), clean_float(my), clean_float(mz)
+            print(f"  🔹 [IMU_MAG] {ts}ms: Acc=({ax:.2f}, {ay:.2f}, {az:.2f}) Gyro=({gx:.2f}, {gy:.2f}, {gz:.2f}) Mag=({mx:.2f}, {my:.2f}, {mz:.2f})")
+            batch_data.append({"type": "IMU", "ts": ts, "data": {"ax":ax, "ay":ay, "az":az, "gx":gx, "gy":gy, "gz":gz, "mx":mx, "my":my, "mz":mz}})
+            offset += 44
+            parsed_count += 1
+            
         elif pkt_type == 2: # DATA_TYPE_BMP
             if len(rf_buffer) - offset < 16: break
             pressure, temp = struct.unpack_from('<2f', rf_buffer, offset + 8)
