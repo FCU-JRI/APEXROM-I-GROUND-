@@ -52,7 +52,7 @@ ws_loop    = None
 _ser_global = None  # 由 main() 設定，供 ws_handler 轉發指令至 Serial
 
 # STATENUM 合法範圍（對應 StateMachine.hpp enum）
-_VALID_STATE_IDS = set(range(18))  # 0–17
+_VALID_STATE_IDS = set(range(13))  # 0–12
 
 def clean_float(val):
     if math.isnan(val) or math.isinf(val):

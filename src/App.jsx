@@ -9,24 +9,19 @@ import { SensorValue } from './components/SensorValue';
 
 // STATENUM — 對應 StateMachine.hpp enum（值 0-17）
 const STATES = {
-    0:  { name:"STBY_IDLE",         label:"待機",              group:"standby", next:[1,2,7,15,16,17], critical:false },
+    0:  { name:"STBY_IDLE",         label:"待機",              group:"standby", next:[1,2,10,11,12], critical:false },
     1:  { name:"STBY_BIT",          label:"自我測試",           group:"standby", next:[0],            critical:false },
-    2:  { name:"CAL_GYRO",          label:"陀螺儀校準",         group:"cal",     next:[3],            critical:false },
-    3:  { name:"CAL_ACCEL",         label:"加速計校準",         group:"cal",     next:[4],            critical:false },
-    4:  { name:"CAL_MAG",           label:"磁力計校準",         group:"cal",     next:[5],            critical:false },
-    5:  { name:"CAL_BARO",          label:"氣壓計校準",         group:"cal",     next:[6],            critical:false },
-    6:  { name:"CAL_TEMP",          label:"溫度校準",           group:"cal",     next:[0],            critical:false },
-    7:  { name:"FLIGHT_IGNITION",   label:"點火",               group:"flight",  next:[8],            critical:true  },
-    8:  { name:"FLIGHT_POWERED",    label:"動力上升",           group:"flight",  next:[9],            critical:false },
-    9:  { name:"FLIGHT_INERTIAL",   label:"慣性滑行",           group:"flight",  next:[10],           critical:false },
-    10: { name:"FLIGHT_APOGEE",     label:"頂點 / 減速傘",      group:"flight",  next:[11],           critical:true  },
-    11: { name:"FLIGHT_DESCENT",    label:"下降",               group:"flight",  next:[12,13],        critical:false },
-    12: { name:"MAIN_CHUTE_DEPLOY", label:"分離引擎 / 開主傘", group:"flight",  next:[14],           critical:true  },
-    13: { name:"SKIP_MAIN_CHUTE",   label:"跳過主傘",           group:"flight",  next:[14],           critical:true  },
-    14: { name:"TERMINATE",         label:"任務終止",           group:"flight",  next:[],             critical:true  },
-    15: { name:"DBG_COMM",          label:"Debug: 通訊",        group:"debug",   next:[0],            critical:false },
-    16: { name:"DBG_SENSOR",        label:"Debug: 感測器",      group:"debug",   next:[0],            critical:false },
-    17: { name:"DBG_STORAGE",       label:"Debug: 儲存",        group:"debug",   next:[0],            critical:false },
+    2:  { name:"FLIGHT_IGNITION",   label:"點火",               group:"flight",  next:[3],            critical:true  },
+    3:  { name:"FLIGHT_POWERED",    label:"動力上升",           group:"flight",  next:[4],            critical:false },
+    4:  { name:"FLIGHT_INERTIAL",   label:"慣性滑行",           group:"flight",  next:[5],            critical:false },
+    5:  { name:"FLIGHT_APOGEE",     label:"頂點 / 減速傘",      group:"flight",  next:[6],            critical:true  },
+    6:  { name:"FLIGHT_DESCENT",    label:"下降",               group:"flight",  next:[7,8],          critical:false },
+    7:  { name:"MAIN_CHUTE_DEPLOY", label:"分離引擎 / 開主傘", group:"flight",  next:[9],            critical:true  },
+    8:  { name:"SKIP_MAIN_CHUTE",   label:"跳過主傘",           group:"flight",  next:[9],            critical:true  },
+    9:  { name:"TERMINATE",         label:"任務終止",           group:"flight",  next:[],             critical:true  },
+    10: { name:"DBG_COMM",          label:"Debug: 通訊",        group:"debug",   next:[0],            critical:false },
+    11: { name:"DBG_SENSOR",        label:"Debug: 感測器",      group:"debug",   next:[0],            critical:false },
+    12: { name:"DBG_STORAGE",       label:"Debug: 儲存",        group:"debug",   next:[0],            critical:false },
 };
 
 // === GPS MAP COMPONENT ===
