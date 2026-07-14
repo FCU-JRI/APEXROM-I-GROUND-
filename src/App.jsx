@@ -9,7 +9,7 @@ import { SensorValue } from './components/SensorValue';
 
 // STATENUM — 對應 StateMachine.hpp enum（值 0-17）
 const STATES = {
-    0:  { name:"STBY_IDLE",         label:"待機",              group:"standby", next:[1,2,10,11,12], critical:false },
+    0:  { name:"STBY_IDLE",         label:"待機",              group:"standby", next:[1,2,10,11,12,13], critical:false },
     1:  { name:"STBY_BIT",          label:"自我測試",           group:"standby", next:[0],            critical:false },
     2:  { name:"FLIGHT_IGNITION",   label:"點火",               group:"flight",  next:[3],            critical:true  },
     3:  { name:"FLIGHT_POWERED",    label:"動力上升",           group:"flight",  next:[4],            critical:false },
@@ -22,6 +22,7 @@ const STATES = {
     10: { name:"DBG_COMM",          label:"Debug: 通訊",        group:"debug",   next:[0],            critical:false },
     11: { name:"DBG_SENSOR",        label:"Debug: 感測器",      group:"debug",   next:[0],            critical:false },
     12: { name:"DBG_STORAGE",       label:"Debug: 儲存",        group:"debug",   next:[0],            critical:false },
+    13: { name:"RESET_ORIENTATION", label:"重置姿態為向上",       group:"cal",     next:[0],            critical:false },
 };
 
 // === GPS MAP COMPONENT ===
