@@ -17,43 +17,67 @@ export const Rocket3D = ({ q }) => {
             containerRef.current.appendChild(renderer.domElement);
         }
         
-        const group = new THREE.Group();
-        group.add(new THREE.Mesh(new THREE.CylinderGeometry(0.25,0.25,2.2,32), new THREE.MeshPhongMaterial({ color:0xdddddd })));
-        
-        const nose = new THREE.Mesh(new THREE.ConeGeometry(0.25,0.6,32), new THREE.MeshPhongMaterial({ color:0xff0000 }));
-        nose.position.y = 1.4; 
-        group.add(nose);
+        const rfuWorldGroup = new THREE.Group();
+        // 依據您的需求：世界座標為 RFU (X右, Y入螢幕, Z上)
+        // Three.js 預設為：X右, Y上, Z出螢幕
+        // RFU X (右) -> Three +X (右)
+        // RFU Y (前 / 入螢幕) -> Three -Z (入螢幕)
+        // RFU Z (上) -> Three +Y (上)
+        const matrix = new THREE.Matrix4();
+        matrix.makeBasis(
+            new THREE.Vector3(1, 0, 0),    // 映射 RFU X
+            new THREE.Vector3(0, 0, -1),   // 映射 RFU Y
+            new THREE.Vector3(0, 1, 0)     // 映射 RFU Z
+        );
+        rfuWorldGroup.setRotationFromMatrix(matrix);
+        scene.add(rfuWorldGroup);
 
-        // 加入尾翼作為方向標示
-        const finGeoZ = new THREE.BoxGeometry(0.05, 0.6, 0.4);
-        const finGeoX = new THREE.BoxGeometry(0.4, 0.6, 0.05);
+        const rfuRocket = new THREE.Group();
         
-        // 紅色尾翼 (放在 +Z 軸) 也就是「正面」標示
-        const finFront = new THREE.Mesh(finGeoZ, new THREE.MeshPhongMaterial({ color:0xff0000 }));
-        finFront.position.set(0, -0.8, 0.35);
-        group.add(finFront);
+        // 1. Build the rocket in the new Body Frame (X=Right, Y=Bottom, Z=Nose)
+        // Cylinder along Z axis
+        const bodyGeo = new THREE.CylinderGeometry(0.25, 0.25, 2.2, 32);
+        bodyGeo.rotateX(Math.PI / 2); // Rotate to align with Z axis
+        rfuRocket.add(new THREE.Mesh(bodyGeo, new THREE.MeshPhongMaterial({ color:0xdddddd })));
         
-        const finBack = new THREE.Mesh(finGeoZ, new THREE.MeshPhongMaterial({ color:0x555555 }));
-        finBack.position.set(0, -0.8, -0.35);
-        group.add(finBack);
-        
-        const finRight = new THREE.Mesh(finGeoX, new THREE.MeshPhongMaterial({ color:0x555555 }));
-        finRight.position.set(0.35, -0.8, 0);
-        group.add(finRight);
-        
-        const finLeft = new THREE.Mesh(finGeoX, new THREE.MeshPhongMaterial({ color:0x555555 }));
-        finLeft.position.set(-0.35, -0.8, 0);
-        group.add(finLeft);
+        // Nose cone at +Z
+        const noseGeo = new THREE.ConeGeometry(0.25, 0.6, 32);
+        noseGeo.rotateX(Math.PI / 2);
+        noseGeo.translate(0, 0, 1.4);
+        rfuRocket.add(new THREE.Mesh(noseGeo, new THREE.MeshPhongMaterial({ color:0xff0000 })));
 
-        scene.add(group); 
-        rocketRef.current = group;
+        // Top fin (Red) at -Y
+        const finGeoY = new THREE.BoxGeometry(0.05, 0.4, 0.6); 
+        const topFin = new THREE.Mesh(finGeoY, new THREE.MeshPhongMaterial({ color:0xff0000 }));
+        topFin.position.set(0, -0.35, -0.8);
+        rfuRocket.add(topFin);
         
-        const dl = new THREE.DirectionalLight(0xffffff,1.2); 
-        dl.position.set(5,5,5); 
+        // Belly fin at +Y
+        const bottomFin = new THREE.Mesh(finGeoY, new THREE.MeshPhongMaterial({ color:0x555555 }));
+        bottomFin.position.set(0, 0.35, -0.8);
+        rfuRocket.add(bottomFin);
+        
+        // Left fin at -X
+        const finGeoX = new THREE.BoxGeometry(0.4, 0.05, 0.6);
+        const leftFin = new THREE.Mesh(finGeoX, new THREE.MeshPhongMaterial({ color:0x555555 }));
+        leftFin.position.set(-0.35, 0, -0.8);
+        rfuRocket.add(leftFin);
+        
+        // Right fin at +X
+        const rightFin = new THREE.Mesh(finGeoX, new THREE.MeshPhongMaterial({ color:0x555555 }));
+        rightFin.position.set(0.35, 0, -0.8);
+        rfuRocket.add(rightFin);
+
+        rfuWorldGroup.add(rfuRocket); 
+        rocketRef.current = rfuRocket;
+        
+        const dl = new THREE.DirectionalLight(0xffffff, 1.2); 
+        dl.position.set(5, 5, 5); 
         scene.add(dl);
         
         scene.add(new THREE.AmbientLight(0x222222)); 
-        camera.position.z = 4.5;
+        camera.position.set(2, 2, 4.5);
+        camera.lookAt(0, 0, 0);
         
         let animationFrameId;
         const animate = () => { 
@@ -70,14 +94,9 @@ export const Rocket3D = ({ q }) => {
     
     useEffect(() => {
         if (rocketRef.current && q) {
-            // 根據實測校準數據：
-            // 左傾90度 (Nose Left)  => QX = -0.707
-            // 右傾90度 (Nose Right) => QX = +0.707
-            // 這代表實體感測器的 X 軸是「朝後 (Into screen)」，Y 軸是「朝左」，Z 軸是「朝上」
-            // Three.js 座標系：X 朝右，Y 朝上，Z 朝前 (Out of screen)
-            // 映射關係：Three.X = -Phys.Y, Three.Y = Phys.Z, Three.Z = -Phys.X
-            // 因此四元數映射為：x' = -q.y, y' = q.z, z' = -q.x, w' = q.w
-            rocketRef.current.setRotationFromQuaternion(new THREE.Quaternion(-q[2], q[3], -q[1], q[0]));
+            // Three.js 的 Quaternion 參數順序固定為 (x, y, z, w)
+            // 如果 monitor.py 傳來的是 [w, x, y, z]，必須對應放入才能確保 3D 旋轉數學正確
+            rocketRef.current.setRotationFromQuaternion(new THREE.Quaternion(q[1], q[2], q[3], q[0]));
         }
     }, [q]);
     

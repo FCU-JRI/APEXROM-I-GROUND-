@@ -57,7 +57,9 @@ const GpsMap = ({ gps, trajectory }) => {
 
 function App() {
     const [currStateId, setCurrStateId] = useState(0);
-    const [wsConnected, setWsConnected] = useState(false);
+    const [wsUrls,      setWsUrls]      = useState([`ws://${window.location.hostname || "localhost"}:8765`]);
+    const [wsStatuses,  setWsStatuses]  = useState({});
+    const [showWsModal, setShowWsModal] = useState(false);
     const [isLive,      setIsLive]      = useState(true);
     const [histIdx,     setHistIdx]     = useState(0);
     const [history,     setHistory]     = useState([]);
@@ -67,29 +69,35 @@ function App() {
     const [showExport,  setShowExport]  = useState(false);
     const [exportStart, setExportStart] = useState(0);
     const [exportEnd,   setExportEnd]   = useState(600);
-    const wsRef = useRef(null);
+    const wsRefs = useRef({});
+    const seenPkts = useRef(new Set());
 
     const addCmdLog = useCallback((msg) => {
         const t = new Date().toLocaleTimeString('zh-TW', { hour12:false });
         setCmdLog(prev => [`[${t}] ${msg}`, ...prev].slice(0, 100));
     }, []);
 
-    // WebSocket — 永久連線，僅初始化一次
+    // WebSocket — 支援多個連線並進行封包去重
     useEffect(() => {
-        let ws, timer;
+        const timers = {};
         let isMounted = true;
-        const connect = () => {
+
+        const connect = (url) => {
             if (!isMounted) return;
-            const host = window.location.hostname || "localhost";
-            console.log(host);
-            ws = new WebSocket(`ws://${host}:8765`);
-            wsRef.current = ws;
-            ws.onopen  = () => { if (isMounted) { setWsConnected(true);  addCmdLog("✅ 已連線至 Monitor WebSocket"); } };
+            const ws = new WebSocket(url);
+            wsRefs.current[url] = ws;
+            
+            ws.onopen  = () => { 
+                if (isMounted) { 
+                    setWsStatuses(prev => ({ ...prev, [url]: true }));  
+                    addCmdLog(`✅ 已連線至 ${url}`); 
+                } 
+            };
             ws.onclose = () => { 
                 if (isMounted) { 
-                    setWsConnected(false); 
-                    addCmdLog("❌ WebSocket 斷線，3 秒後重連…"); 
-                    timer = setTimeout(connect, 3000); 
+                    setWsStatuses(prev => ({ ...prev, [url]: false })); 
+                    addCmdLog(`❌ 斷線 ${url}，3 秒後重連…`); 
+                    timers[url] = setTimeout(() => connect(url), 3000); 
                 }
             };
             ws.onerror = () => {};
@@ -98,7 +106,22 @@ function App() {
                 try {
                     const d = JSON.parse(e.data);
                     if (d.batch) {
-                        setHistory(h => [...h, d].slice(-1000));
+                        const pktId = d.pkt !== undefined ? d.pkt : Math.max(...d.batch.map(b => b.ts || 0));
+                        if (seenPkts.current.has(pktId)) return; // 發現重複封包，丟棄以去重
+                        seenPkts.current.add(pktId);
+                        
+                        // 避免 Set 無限增長
+                        if (seenPkts.current.size > 5000) {
+                            const arr = Array.from(seenPkts.current).slice(-2500);
+                            seenPkts.current = new Set(arr);
+                        }
+
+                        setHistory(h => {
+                            const newH = [...h, d].sort((a,b) => (a.pkt || 0) - (b.pkt || 0));
+                            // 解除 1000 筆限制，保留高達 10 萬筆以確保 CSV 匯出完整 (圖表已獨立限制 150 筆)
+                            return newH.slice(-100000);
+                        });
+                        
                         // 攔截 LOG 封包，同步火箭端狀態
                         d.batch.forEach(b => {
                             if (b.type === "LOG" && b.data && b.data.msg) {
@@ -131,16 +154,21 @@ function App() {
                 } catch (err) {}
             };
         };
-        connect();
+        
+        wsUrls.forEach(url => connect(url));
+
         return () => { 
             isMounted = false;
-            clearTimeout(timer); 
-            if (ws) {
-                ws.onclose = null; // IMPORTANT: Prevent onclose from firing and scheduling a reconnect!
-                ws.close(); 
-            }
+            wsUrls.forEach(url => {
+                clearTimeout(timers[url]);
+                if (wsRefs.current[url]) {
+                    wsRefs.current[url].onclose = null; // IMPORTANT: Prevent onclose from firing and scheduling a reconnect!
+                    wsRefs.current[url].close(); 
+                    delete wsRefs.current[url];
+                }
+            });
         };
-    }, [addCmdLog]);
+    }, [wsUrls, addCmdLog]);
 
     useEffect(() => {
         if (isLive && history.length > 0) setHistIdx(history.length - 1);
@@ -153,13 +181,20 @@ function App() {
         if (s.critical) {
             if (!window.confirm(`⚠️ 警告：即將發送飛行器指令\n\n→ [${stateId}] ${s.name}  (${s.label})\n\n此操作將直接影響飛行器，請再次確認！`)) return;
         }
-        const ws = wsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type:"cmd", action:"setState", stateId }));
+        
+        let sentCount = 0;
+        Object.values(wsRefs.current).forEach(ws => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type:"cmd", action:"setState", stateId }));
+                sentCount++;
+            }
+        });
+
+        if (sentCount > 0) {
             setCurrStateId(stateId);
-            addCmdLog(`📡 [GND→FC] 切換至 ${s.name} (${stateId})`);
+            addCmdLog(`📡 [GND→FC] 切換至 ${s.name} (${stateId}) (發送至 ${sentCount} 個站點)`);
         } else {
-            addCmdLog("❌ WebSocket 未連線，無法發送指令");
+            addCmdLog("❌ 無任何 WebSocket 連線，無法發送指令");
         }
     }, [addCmdLog]);
 
@@ -349,6 +384,12 @@ function App() {
         }
     }
 
+    const connectedCount = Object.values(wsStatuses).filter(Boolean).length;
+    const totalCount = wsUrls.length;
+    const wsStatusClass = connectedCount === totalCount && totalCount > 0 
+        ? 'bg-green-900/50 text-green-400 border-green-700' 
+        : (connectedCount > 0 ? 'bg-yellow-900/50 text-yellow-400 border-yellow-700' : 'bg-red-900/50 text-red-400 border-red-700 animate-pulse');
+
     return (
         <div className="h-full flex flex-col gap-3 relative">
             <div className="scanline"></div>
@@ -358,8 +399,8 @@ function App() {
                 <div className="text-lg font-bold text-neon uppercase tracking-tighter">JRI P2026 GND V2.1</div>
                 <div className="flex gap-3 items-center">
                     {!isLive && <div className="text-sm text-yellow-500 font-bold animate-pulse">HISTORICAL PLAYBACK</div>}
-                    <div id="ws-status" className={`px-2 py-0.5 rounded text-xs font-bold border ${wsConnected ? 'bg-green-900/50 text-green-400 border-green-700' : 'bg-red-900/50 text-red-400 border-red-700 animate-pulse'}`}>
-                        {wsConnected ? '● WS CONNECTED' : '○ WS DISCONNECTED'}
+                    <div id="ws-status" className={`px-2 py-0.5 rounded text-xs font-bold border cursor-pointer hover:opacity-80 transition-opacity ${wsStatusClass}`} onClick={() => setShowWsModal(true)} title="點擊管理多個地面站 WebSocket">
+                        {connectedCount > 0 ? `● WS CONNECTED (${connectedCount}/${totalCount})` : '○ WS DISCONNECTED'}
                     </div>
                     <div className="px-3 py-1 bg-black/60 border border-cyan-900 text-sm font-bold text-cyan-400">
                         [{currStateId}] {currState.name}
@@ -375,7 +416,7 @@ function App() {
                         <TeleCard label="Alt"     val={alt.toFixed(3)} unit="m"   />
                         <TeleCard label="Vel"     val={vel.toFixed(3)} unit="m/s" />
                         <TeleCard label="Accel"   val={acc.toFixed(3)} unit="g"   />
-                        <TeleCard label="Packets" val={Number(view?.pkt ?? 0).toFixed(3)} unit="idx" />
+                        <TeleCard label="Packets" val={Number(view?.pkt ?? 0).toFixed(0)} unit="idx" />
                     </div>
                     <div className="glass-panel flex-1 flex flex-col items-center justify-center relative min-h-[140px]">
                         <div className="text-sm text-cyan-400 font-bold uppercase absolute top-2 left-2 flex flex-col gap-0.5 z-10">
@@ -607,6 +648,48 @@ function App() {
                     </div>
                 )}
             </div>
+
+            {/* WebSocket Manager Modal */}
+            {showWsModal && (
+                <div className="absolute inset-0 bg-black/80 z-50 flex items-center justify-center">
+                    <div className="glass-panel p-4 max-w-md w-full flex flex-col gap-3">
+                        <h3 className="text-cyan-400 font-bold uppercase border-b border-cyan-900 pb-2">📡 追蹤多個地面站 WebSocket</h3>
+                        <p className="text-xs text-gray-400 mb-2">可新增多個 Ground Station IP，系統將根據封包編號自動過濾重複資料，防止掉包斷線。</p>
+                        
+                        <div className="flex flex-col gap-2 max-h-60 overflow-y-auto custom-scrollbar pr-1">
+                            {wsUrls.map((url, i) => (
+                                <div key={i} className="flex gap-2 items-center bg-black/40 p-1.5 rounded border border-gray-800">
+                                    <div className={`w-2.5 h-2.5 rounded-full ${wsStatuses[url] ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-red-500 shadow-[0_0_8px_#ef4444]'}`}></div>
+                                    <input type="text" value={url} readOnly className="flex-1 bg-transparent border-none outline-none text-xs text-gray-300 font-mono" />
+                                    <button onClick={() => {
+                                        setWsUrls(urls => urls.filter((_, idx) => idx !== i));
+                                    }} className="px-2 py-1 bg-red-900/30 hover:bg-red-900/80 text-red-400 text-xs rounded border border-red-800 transition-colors">移除</button>
+                                </div>
+                            ))}
+                        </div>
+                        
+                        <div className="flex gap-2 mt-2">
+                            <input type="text" id="new-ws-url" placeholder={`ws://${window.location.hostname || "192.168.x.x"}:8765`} className="flex-1 bg-black/80 border border-cyan-900 focus:border-cyan-500 outline-none text-cyan-400 text-xs px-2 py-1.5 rounded font-mono" 
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter') document.getElementById('btn-add-ws').click();
+                                }}
+                            />
+                            <button id="btn-add-ws" onClick={() => {
+                                const input = document.getElementById('new-ws-url');
+                                const val = input.value.trim();
+                                if (val && !wsUrls.includes(val)) {
+                                    setWsUrls(urls => [...urls, val]);
+                                    input.value = '';
+                                }
+                            }} className="px-4 py-1.5 bg-cyan-900/50 hover:bg-cyan-800 text-cyan-400 text-xs font-bold rounded border border-cyan-700 transition-colors">新增</button>
+                        </div>
+                        
+                        <div className="mt-4 pt-3 border-t border-gray-800 flex justify-end">
+                            <button onClick={() => setShowWsModal(false)} className="px-6 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-bold rounded transition-colors">完成</button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

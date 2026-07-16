@@ -1,9 +1,18 @@
 import sys
 import subprocess
+import os
+import datetime
 
 # stdout 強制不緩衝，確保 daemon thread 的輸出即時可見
 sys.stdout.reconfigure(line_buffering=True)
 
+# 建立日誌資料夾 (使用絕對路徑避免 os.chdir 影響)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+JSON_LOG_FILE = os.path.join(LOG_DIR, f"telemetry_{current_time}.jsonl")
+RAW_LOG_FILE  = os.path.join(LOG_DIR, f"raw_serial_{current_time}.log")
 
 import serial
 import serial.tools.list_ports
@@ -80,7 +89,11 @@ async def ws_handler(websocket):
                     else:
                         print("[WS→Serial] ⚠️ Serial port 未開啟，指令丟棄", flush=True)
             except Exception as e:
-                print(f"[WS CMD] ❌ 解析或處理錯誤：{e}", flush=True)
+                print(f"[WS CMD] ❌ 內容解析錯誤：{e}", flush=True)
+    except websockets.exceptions.ConnectionClosed:
+        pass # 客戶端正常斷線
+    except Exception as e:
+        print(f"[WS] ⚠️ WebSocket 異常斷線：{e}", flush=True)
     finally:
         ws_clients.discard(websocket)
 
@@ -95,7 +108,8 @@ async def broadcast_ws(batch_data):
 async def _ws_main():
     global ws_loop
     ws_loop = asyncio.get_running_loop()
-    async with websockets.serve(ws_handler, "0.0.0.0", 8765):
+    # 增加 ping 機制，剔除殭屍連線以防記憶體與效能流失
+    async with websockets.serve(ws_handler, "0.0.0.0", 8765, ping_interval=10, ping_timeout=5):
         await asyncio.Future()  # 永久等待，直到 thread 結束
 
 def ws_server_thread():
@@ -235,42 +249,80 @@ def parse_rf_buffer():
     # 從緩衝區移除已解析的部分
     rf_buffer = rf_buffer[offset:]
     
+    # 斷線保護：避免緩衝區因連續解析失敗而無限增長，導致記憶體溢出
+    if len(rf_buffer) > 8192:
+        print("⚠️ 警告：Serial 緩衝區過大，懷疑存在大量毀損資料，執行強制清空以維持穩定性。")
+        rf_buffer.clear()
+    
     if parsed_count > 0:
+        if batch_data:
+            # 硬碟強制落地寫入 (避免前端當機導致資料遺失)
+            try:
+                with open(JSON_LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"batch": batch_data, "ts_local": time.time()}) + "\n")
+            except Exception as e:
+                print(f"⚠️ 硬碟日誌寫入失敗: {e}")
+                
         if batch_data and ws_loop:
             asyncio.run_coroutine_threadsafe(broadcast_ws(batch_data), ws_loop)
 
 
-def read_from_port(ser):
-    global rf_buffer
+def read_from_port():
+    global rf_buffer, _ser_global
     while True:
         try:
-            # 優先處理待發送指令
-            while not serial_cmd_queue.empty():
-                cmd = serial_cmd_queue.get_nowait()
-                ser.write(cmd)
+            if _ser_global and _ser_global.is_open:
+                # 優先處理待發送指令
+                while not serial_cmd_queue.empty():
+                    cmd = serial_cmd_queue.get_nowait()
+                    _ser_global.write(cmd)
 
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                
-                if "Wired Telemetry Data:" in line:
-                    try:
-                        print("\n==================== NEW LORA CHUNK ====================")
-                        hex_str = line.split("Wired Telemetry Data:")[1].strip()
-                        hex_list = hex_str.split()
-                        byte_data = bytes([int(x, 16) for x in hex_list])
-                        rf_buffer.extend(byte_data)
-                        
-                        # 呼叫解析函式
-                        parse_rf_buffer()
-                    except Exception as e:
-                        print(f"  -> [解析錯誤] {e}")
+                if _ser_global.in_waiting > 0:
+                    line = _ser_global.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    # 原始 Serial 輸出無腦寫入硬碟
+                    if line:
+                        try:
+                            with open(RAW_LOG_FILE, "a", encoding="utf-8") as f:
+                                f.write(line + "\n")
+                        except:
+                            pass
+                    
+                    if "Wired Telemetry Data:" in line:
+                        try:
+                            print("\n==================== NEW LORA CHUNK ====================")
+                            hex_str = line.split("Wired Telemetry Data:")[1].strip()
+                            hex_list = hex_str.split()
+                            byte_data = bytes([int(x, 16) for x in hex_list])
+                            rf_buffer.extend(byte_data)
+                            
+                            # 呼叫解析函式
+                            parse_rf_buffer()
+                        except Exception as e:
+                            print(f"  -> [解析錯誤] {e}")
+                    elif line:
+                        print(line)
                 else:
-                    print(line)
+                    time.sleep(0.01)
             else:
-                time.sleep(0.01)
+                time.sleep(1)
+        except (serial.SerialException, OSError) as e:
+            print(f"\n❌ [硬體異常斷線] Serial Error: {e}")
+            if _ser_global:
+                _ser_global.close()
+            # 進入自動重連迴圈
+            while True:
+                try:
+                    time.sleep(2)
+                    print(f"🔄 嘗試重新連線至 {_ser_global.port} ...")
+                    _ser_global.open()
+                    print(f"✅ 成功重新連線至 {_ser_global.port}!")
+                    break
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"Serial error: {e}")
-            break
+            print(f"\n❌ [未預期錯誤] read_from_port: {e}")
+            time.sleep(1)
 
 def write_to_port(ser):
     from prompt_toolkit import prompt
@@ -318,7 +370,18 @@ def main():
         # 在 open 之前先設定好 DTR 和 RTS，避免一連線就觸發 ESP32 重新開機
         ser.dtr = False
         ser.rts = False
-        ser.open()
+        
+        try:
+            ser.open()
+        except Exception as e:
+            if "Invalid argument" in str(e) or "termios.error" in type(e).__name__:
+                print(f"\n❌ [錯誤] 無法開啟 Serial Port '{serial_port}' (Invalid argument)")
+                print("💡 這在 macOS 上通常是因為您選到了「藍牙連接埠 (Bluetooth-Incoming-Port)」或虛擬連接埠。")
+                print("👉 解決方法：重新執行程式，並在選單中手動選擇名稱包含 'usbserial' 或 'usbmodem' 的正確選項，不要直接按 Enter。")
+                sys.exit(1)
+            else:
+                raise e
+                
         _ser_global = ser  # 讓 ws_handler 可存取 Serial port
         print(f"成功連接 {serial_port} @ {BAUD_RATE} baud.")
         
@@ -353,7 +416,7 @@ def main():
         # 啟動 HTTP 靜態伺服器 (供前端使用)
         threading.Thread(target=serve_http, daemon=True).start()
         
-        read_thread = threading.Thread(target=read_from_port, args=(ser,), daemon=True)
+        read_thread = threading.Thread(target=read_from_port, daemon=True)
         read_thread.start()
         
         write_to_port(ser)
