@@ -527,7 +527,7 @@ def main():
         ser.baudrate = BAUD_RATE
         ser.timeout = 1
         # 在 open 之前先設定好 DTR 和 RTS，避免一連線就觸發 ESP32 重新開機
-        ser.dtr = False
+        ser.dtr = True
         ser.rts = False
         
         try:
