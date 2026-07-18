@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { MapContainer, TileLayer, Polyline, Marker, useMap } from 'react-leaflet';
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, ReferenceLine, Label } from 'recharts';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, ReferenceLine, Label } from 'recharts';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
+import mqtt from 'mqtt';
 import { Rocket3D } from './components/Rocket3D';
 import { TeleCard } from './components/TeleCard';
 import { SensorValue } from './components/SensorValue';
@@ -55,10 +56,20 @@ const GpsMap = ({ gps, trajectory }) => {
     );
 };
 
+const getLogMsgColorClass = (msg) => {
+    const upper = msg.toUpperCase();
+    if (upper.includes("ERROR") || upper.includes("FAILED")) return "text-red-400 font-bold";
+    if (upper.includes("TRIGGER") || upper.includes("DECISION")) return "text-amber-400";
+    if (upper.includes("ACTION")) return "text-cyan-400 font-semibold";
+    if (upper.includes("EVENT")) return "text-emerald-400";
+    return "text-slate-300";
+};
+
 function App() {
     const [currStateId, setCurrStateId] = useState(0);
-    const [wsUrls,      setWsUrls]      = useState([`ws://${window.location.hostname || "localhost"}:8765`]);
-    const [wsStatuses,  setWsStatuses]  = useState({});
+    const defaultIp = import.meta.env.VITE_MQTT_BROKER_IP || window.location.hostname || "localhost";
+    const [mqttUrls,    setMqttUrls]    = useState([`ws://${defaultIp}:9001`]);
+    const [mqttStatuses,setMqttStatuses]= useState({});
     const [showWsModal, setShowWsModal] = useState(false);
     const [isLive,      setIsLive]      = useState(true);
     const [histIdx,     setHistIdx]     = useState(0);
@@ -69,7 +80,8 @@ function App() {
     const [showExport,  setShowExport]  = useState(false);
     const [exportStart, setExportStart] = useState(0);
     const [exportEnd,   setExportEnd]   = useState(600);
-    const wsRefs = useRef({});
+    const [boardFreq,   setBoardFreq]   = useState(null);
+    const mqttRefs = useRef({});
     const seenPkts = useRef(new Set());
 
     const addCmdLog = useCallback((msg) => {
@@ -77,35 +89,47 @@ function App() {
         setCmdLog(prev => [`[${t}] ${msg}`, ...prev].slice(0, 100));
     }, []);
 
-    // WebSocket — 支援多個連線並進行封包去重
+    // MQTT — 支援多個 Broker 連線並進行封包去重
     useEffect(() => {
-        const timers = {};
         let isMounted = true;
 
         const connect = (url) => {
             if (!isMounted) return;
-            const ws = new WebSocket(url);
-            wsRefs.current[url] = ws;
+            const client = mqtt.connect(url, {
+                keepalive: 30,
+                reconnectPeriod: 3000
+            });
+            mqttRefs.current[url] = client;
             
-            ws.onopen  = () => { 
+            client.on('connect', () => { 
                 if (isMounted) { 
-                    setWsStatuses(prev => ({ ...prev, [url]: true }));  
-                    addCmdLog(`✅ 已連線至 ${url}`); 
+                    setMqttStatuses(prev => ({ ...prev, [url]: true }));  
+                    addCmdLog(`✅ 已連線至 MQTT Broker: ${url}`); 
+                    client.subscribe('fc/telemetry');
+                    client.publish('fc/cmd', JSON.stringify({ type: "cmd", action: "queryFreq" }));
                 } 
-            };
-            ws.onclose = () => { 
+            });
+            client.on('offline', () => { 
                 if (isMounted) { 
-                    setWsStatuses(prev => ({ ...prev, [url]: false })); 
-                    addCmdLog(`❌ 斷線 ${url}，3 秒後重連…`); 
-                    timers[url] = setTimeout(() => connect(url), 3000); 
+                    setMqttStatuses(prev => ({ ...prev, [url]: false })); 
+                    addCmdLog(`❌ 斷線 ${url}，自動重連中…`); 
                 }
-            };
-            ws.onerror = () => {};
-            ws.onmessage = (e) => {
-                if (!isMounted) return;
+            });
+            client.on('error', () => {});
+            client.on('message', (topic, message) => {
+                if (!isMounted || topic !== 'fc/telemetry') return;
                 try {
-                    const d = JSON.parse(e.data);
+                    const d = JSON.parse(message.toString());
+                    if (d.type === 'status') {
+                        if (d.board_freq !== undefined && d.board_freq !== null) {
+                            setBoardFreq(d.board_freq);
+                        }
+                        return;
+                    }
                     if (d.batch) {
+                        if (d.board_freq !== undefined && d.board_freq !== null) {
+                            setBoardFreq(d.board_freq);
+                        }
                         const pktId = d.pkt !== undefined ? d.pkt : Math.max(...d.batch.map(b => b.ts || 0));
                         if (seenPkts.current.has(pktId)) return; // 發現重複封包，丟棄以去重
                         seenPkts.current.add(pktId);
@@ -118,7 +142,6 @@ function App() {
 
                         setHistory(h => {
                             const newH = [...h, d].sort((a,b) => (a.pkt || 0) - (b.pkt || 0));
-                            // 解除 1000 筆限制，保留高達 10 萬筆以確保 CSV 匯出完整 (圖表已獨立限制 150 筆)
                             return newH.slice(-100000);
                         });
                         
@@ -152,23 +175,21 @@ function App() {
                         });
                     }
                 } catch (err) {}
-            };
+            });
         };
         
-        wsUrls.forEach(url => connect(url));
+        mqttUrls.forEach(url => connect(url));
 
         return () => { 
             isMounted = false;
-            wsUrls.forEach(url => {
-                clearTimeout(timers[url]);
-                if (wsRefs.current[url]) {
-                    wsRefs.current[url].onclose = null; // IMPORTANT: Prevent onclose from firing and scheduling a reconnect!
-                    wsRefs.current[url].close(); 
-                    delete wsRefs.current[url];
+            mqttUrls.forEach(url => {
+                if (mqttRefs.current[url]) {
+                    mqttRefs.current[url].end(true); 
+                    delete mqttRefs.current[url];
                 }
             });
         };
-    }, [wsUrls, addCmdLog]);
+    }, [mqttUrls, addCmdLog]);
 
     useEffect(() => {
         if (isLive && history.length > 0) setHistIdx(history.length - 1);
@@ -183,18 +204,33 @@ function App() {
         }
         
         let sentCount = 0;
-        Object.values(wsRefs.current).forEach(ws => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type:"cmd", action:"setState", stateId }));
+        Object.values(mqttRefs.current).forEach(client => {
+            if (client && client.connected) {
+                client.publish('fc/cmd', JSON.stringify({ type:"cmd", action:"setState", stateId }));
                 sentCount++;
             }
         });
 
         if (sentCount > 0) {
-            setCurrStateId(stateId);
-            addCmdLog(`📡 [GND→FC] 切換至 ${s.name} (${stateId}) (發送至 ${sentCount} 個站點)`);
+            addCmdLog(`📡 [GND→FC] 切換至 ${s.name} (${stateId}) (透過 MQTT 發送)`);
         } else {
-            addCmdLog("❌ 無任何 WebSocket 連線，無法發送指令");
+            addCmdLog("❌ 無任何 MQTT 連線，無法發送指令");
+        }
+    }, [addCmdLog]);
+
+    const handleSetFreq = useCallback((freq) => {
+        let sentCount = 0;
+        Object.values(mqttRefs.current).forEach(client => {
+            if (client && client.connected) {
+                client.publish('fc/cmd', JSON.stringify({ type: "cmd", action: "setFreq", frequency: freq }));
+                sentCount++;
+            }
+        });
+
+        if (sentCount > 0) {
+            addCmdLog(`📡 [GND→RX] 發送切換頻率指令: ${freq / 1000000} MHz`);
+        } else {
+            addCmdLog("❌ 無任何 MQTT 連線，無法發送切換頻率指令");
         }
     }, [addCmdLog]);
 
@@ -226,6 +262,7 @@ function App() {
     const vel    = getLastVal("KALMAN_ALTITUDE")?.vz  ?? 0;
     const acc    = getLastVal("IMU")?.az               ?? 0;
     const q      = getLastVal("KALMAN_QUATERNION")?.q  ?? [1,0,0,0];
+    const rssi   = view?.rssi;
     
     // GPS 是低頻資料，必須使用 getLastVal
     const gps    = getLastVal("KALMAN_GPS") ?? getLastVal("GPS") ?? { lat: 0, lon: 0 };
@@ -384,8 +421,8 @@ function App() {
         }
     }
 
-    const connectedCount = Object.values(wsStatuses).filter(Boolean).length;
-    const totalCount = wsUrls.length;
+    const connectedCount = Object.values(mqttStatuses).filter(Boolean).length;
+    const totalCount = mqttUrls.length;
     const wsStatusClass = connectedCount === totalCount && totalCount > 0 
         ? 'bg-green-900/50 text-green-400 border-green-700' 
         : (connectedCount > 0 ? 'bg-yellow-900/50 text-yellow-400 border-yellow-700' : 'bg-red-900/50 text-red-400 border-red-700 animate-pulse');
@@ -395,15 +432,34 @@ function App() {
             <div className="scanline"></div>
 
             {/* Header */}
-            <header className="glass-panel p-2 flex justify-between items-center glow-cyan">
+            <header className="glass-panel p-2 flex justify-between items-center glow-cyan bg-slate-950/40">
                 <div className="text-lg font-bold text-neon uppercase tracking-tighter">JRI P2026 GND V2.1</div>
-                <div className="flex gap-3 items-center">
-                    {!isLive && <div className="text-sm text-yellow-500 font-bold animate-pulse">HISTORICAL PLAYBACK</div>}
-                    <div id="ws-status" className={`px-2 py-0.5 rounded text-xs font-bold border cursor-pointer hover:opacity-80 transition-opacity ${wsStatusClass}`} onClick={() => setShowWsModal(true)} title="點擊管理多個地面站 WebSocket">
-                        {connectedCount > 0 ? `● WS CONNECTED (${connectedCount}/${totalCount})` : '○ WS DISCONNECTED'}
+                <div className="flex gap-4 items-center">
+                    {/* Frequency Band Selection */}
+                    <div className="flex items-center gap-2.5 px-2.5 py-1 bg-slate-950/80 border border-slate-800/80 rounded-md text-xs">
+                        <span className="text-slate-400 font-bold uppercase tracking-wider text-[10px]">RX BAND:</span>
+                        <div className="segment-group">
+                            <div 
+                                className={`segment-item ${boardFreq === 433000000 ? 'active' : ''}`}
+                                onClick={() => handleSetFreq(433000000)}
+                            >
+                                433M
+                            </div>
+                            <div 
+                                className={`segment-item ${boardFreq === 915000000 ? 'active' : ''}`}
+                                onClick={() => handleSetFreq(915000000)}
+                            >
+                                915M
+                            </div>
+                        </div>
                     </div>
-                    <div className="px-3 py-1 bg-black/60 border border-cyan-900 text-sm font-bold text-cyan-400">
-                        [{currStateId}] {currState.name}
+
+                    {!isLive && <div className="text-xs text-yellow-500 font-bold animate-pulse bg-yellow-950/30 border border-yellow-800/40 px-2 py-0.5 rounded uppercase">HISTORICAL PLAYBACK</div>}
+                    <div id="ws-status" className={`px-2.5 py-1 rounded text-xs font-bold border cursor-pointer hover:opacity-80 transition-opacity ${wsStatusClass}`} onClick={() => setShowWsModal(true)} title="點擊管理多個地面站 MQTT Broker">
+                        {connectedCount > 0 ? `● MQTT CONNECTED (${connectedCount}/${totalCount})` : '○ MQTT DISCONNECTED'}
+                    </div>
+                    <div className="px-3 py-1.5 lcd-panel text-xs font-bold text-cyan-400 font-mono tracking-wide">
+                        STATUS: [{currStateId}] {currState.name}
                     </div>
                 </div>
             </header>
@@ -417,24 +473,27 @@ function App() {
                         <TeleCard label="Vel"     val={vel.toFixed(3)} unit="m/s" />
                         <TeleCard label="Accel"   val={acc.toFixed(3)} unit="g"   />
                         <TeleCard label="Packets" val={Number(view?.pkt ?? 0).toFixed(0)} unit="idx" />
+                        <div className="col-span-2">
+                            <TeleCard label="RSSI" val={rssi !== undefined ? `${rssi}` : 'N/A'} unit="dBm" />
+                        </div>
                     </div>
-                    <div className="glass-panel flex-1 flex flex-col items-center justify-center relative min-h-[140px]">
-                        <div className="text-sm text-cyan-400 font-bold uppercase absolute top-2 left-2 flex flex-col gap-0.5 z-10">
-                            <span><span className="text-gray-500">QW:</span> {q[0].toFixed(3)}</span>
-                            <span><span className="text-gray-500">QX:</span> {q[1].toFixed(3)}</span>
-                            <span><span className="text-gray-500">QY:</span> {q[2].toFixed(3)}</span>
-                            <span><span className="text-gray-500">QZ:</span> {q[3].toFixed(3)}</span>
+                    <div className="glass-panel flex-1 flex flex-col items-center justify-center relative min-h-[140px] grid-radar">
+                        <div className="text-[10px] text-cyan-400/80 font-mono uppercase absolute top-2 left-2 flex flex-col gap-0.5 z-10 bg-slate-950/75 p-1 rounded border border-slate-800/50">
+                            <span><span className="text-slate-500">QW:</span> {q[0].toFixed(3)}</span>
+                            <span><span className="text-slate-500">QX:</span> {q[1].toFixed(3)}</span>
+                            <span><span className="text-slate-500">QY:</span> {q[2].toFixed(3)}</span>
+                            <span><span className="text-slate-500">QZ:</span> {q[3].toFixed(3)}</span>
                         </div>
                         <Rocket3D q={q} />
-                        <div className="text-xs text-gray-600 uppercase absolute bottom-2">Live Orientation</div>
+                        <div className="text-[9px] text-slate-500 font-bold uppercase absolute bottom-2 tracking-wider">Live Orientation Scope</div>
                     </div>
                     {/* GPS MAP */}
                     <div className="glass-panel h-[160px] flex flex-col p-2 relative overflow-hidden">
-                        <div className="text-sm text-cyan-400 font-bold uppercase mb-1 flex justify-between">
+                        <div className="text-[10px] text-cyan-400 font-bold uppercase mb-1 flex justify-between tracking-wider">
                             <span>GPS MAP</span>
-                            <span className="text-gray-500 font-mono text-xs">{gps.lat !== 0 ? `${gps.lat.toFixed(5)}, ${gps.lon.toFixed(5)}` : 'NO FIX'}</span>
+                            <span className="text-slate-500 font-mono text-xs">{gps.lat !== 0 ? `${gps.lat.toFixed(5)}, ${gps.lon.toFixed(5)}` : 'NO FIX'}</span>
                         </div>
-                        <div className="flex-1 rounded border border-cyan-900/30 overflow-hidden relative bg-black/50 z-0">
+                        <div className="flex-1 rounded border border-slate-800/40 overflow-hidden relative bg-black/50 z-0">
                             <GpsMap gps={gps} trajectory={trajectory} />
                         </div>
                     </div>
@@ -445,7 +504,7 @@ function App() {
                     
                     {/* Raw Sensor Telemetry */}
                     <div className="glass-panel p-2 flex flex-col gap-1 shrink-0">
-                        <div className="p-1 bg-cyan-900/10 border-b border-cyan-900/20 text-xs font-bold text-cyan-400 uppercase mb-1">Raw Sensor Telemetry</div>
+                        <div className="p-1 bg-cyan-950/20 border-b border-cyan-900/10 text-[10px] font-bold text-cyan-400 uppercase mb-1 tracking-wider">Raw Sensor Telemetry</div>
                         <div className="grid grid-cols-3 gap-2">
                             <div className="flex flex-col gap-0.5">
                                 <SensorValue label="ACC_X" val={imu?.ax?.toFixed(3) ?? '0.000'} unit="g" />
@@ -476,10 +535,11 @@ function App() {
                     </div>
 
                     <div className="glass-panel flex flex-col overflow-hidden shrink-0" style={{height:"200px"}}>
-                        <div className="p-1.5 bg-purple-900/10 border-b border-purple-900/20 text-sm font-bold text-purple-400 uppercase">Flight Dynamics</div>
+                        <div className="p-1.5 bg-slate-950/40 border-b border-slate-800/60 text-xs font-bold text-cyan-400 uppercase tracking-wider">Flight Dynamics</div>
                         <div className="flex-1 p-2 w-full h-full text-xs">
                             <ResponsiveContainer width="100%" height="100%">
                                 <LineChart data={chartData} margin={{ top: 15, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" opacity={0.4} />
                                     <XAxis 
                                         dataKey="time" 
                                         type="number" 
@@ -490,24 +550,29 @@ function App() {
                                             if (point && point.tsSec) return `${point.tsSec.toFixed(1)}s [${v}]`;
                                             return `[${v}]`;
                                         }} 
-                                        tick={{fill: '#6b7280', fontSize: 10}} 
+                                        tick={{fill: '#64748b', fontSize: 9, fontFamily: 'var(--font-mono)'}} 
                                     />
-                                    <YAxis yAxisId="left" domain={['auto', 'auto']} tick={{fill: '#6b7280'}} />
-                                    <YAxis yAxisId="right" orientation="right" domain={['auto', 'auto']} tick={{fill: '#6b7280'}} />
+                                    <YAxis yAxisId="left" domain={['auto', 'auto']} tick={{fill: '#64748b', fontSize: 9, fontFamily: 'var(--font-mono)'}} />
+                                    <YAxis yAxisId="right" orientation="right" domain={['auto', 'auto']} tick={{fill: '#64748b', fontSize: 9, fontFamily: 'var(--font-mono)'}} />
                                     <Tooltip 
-                                        contentStyle={{backgroundColor: 'rgba(0,0,0,0.8)', border: '1px solid #1e3a8a', borderRadius: '4px'}} 
-                                        itemStyle={{fontSize: 12, padding: 0}}
+                                        contentStyle={{
+                                            backgroundColor: 'rgba(9, 15, 30, 0.95)', 
+                                            border: '1px solid rgba(0, 242, 254, 0.3)', 
+                                            borderRadius: '4px',
+                                            boxShadow: '0 0 10px rgba(0,0,0,0.8)'
+                                        }} 
+                                        labelStyle={{ color: '#00f2fe', fontFamily: 'var(--font-mono)', fontWeight: 'bold' }}
+                                        itemStyle={{ fontSize: 11, padding: 0 }}
                                         labelFormatter={(label) => {
                                             const point = chartData.find(d => d.time === label);
                                             if (point && point.tsSec) return `Time: ${point.tsSec.toFixed(2)}s [Pkt: ${label}]`;
                                             return `Pkt: ${label}`;
                                         }}
                                     />
-                                    <Legend wrapperStyle={{fontSize: '11px', paddingTop: '4px'}} />
+                                    <Legend wrapperStyle={{fontSize: '10px', paddingTop: '4px', fontFamily: 'var(--font-sans)'}} />
                                     
                                     {/* 繪製狀態切換時間線 */}
                                     {stateEvents.map((ev, idx) => {
-                                        // 找出 chartData 中最接近這個事件 tsSec 的 packet index (time)
                                         let bestIdx = -1;
                                         let minDiff = Infinity;
                                         for (const d of chartData) {
@@ -520,15 +585,15 @@ function App() {
                                         }
                                         if (bestIdx !== -1 && minDiff < 2.0) {
                                             return (
-                                                <ReferenceLine key={idx} x={bestIdx} yAxisId="left" stroke="rgba(251, 191, 36, 0.8)" strokeDasharray="3 3" strokeWidth={2}>
-                                                    <Label value={ev.name} position="insideTopLeft" fill="#fbbf24" fontSize={11} offset={5} />
+                                                <ReferenceLine key={idx} x={bestIdx} yAxisId="left" stroke="rgba(245, 158, 11, 0.8)" strokeDasharray="3 3" strokeWidth={1.5}>
+                                                    <Label value={ev.name} position="insideTopLeft" fill="#f59e0b" fontSize={9} offset={5} />
                                                 </ReferenceLine>
                                             );
                                         }
                                         return null;
                                     })}
 
-                                    <Line yAxisId="left" type="monotone" dataKey="alt" stroke="#06b6d4" strokeWidth={2} dot={false} isAnimationActive={false} name="Alt (m)" />
+                                    <Line yAxisId="left" type="monotone" dataKey="alt" stroke="#00f2fe" strokeWidth={2} dot={false} isAnimationActive={false} name="Alt (m)" />
                                     <Line yAxisId="right" type="monotone" dataKey="vel" stroke="#f59e0b" strokeWidth={2} dot={false} isAnimationActive={false} name="Vel (m/s)" />
                                     <Line yAxisId="right" type="monotone" dataKey="acc" stroke="#ef4444" strokeWidth={2} dot={false} isAnimationActive={false} name="Acc (g)" />
                                 </LineChart>
@@ -536,23 +601,23 @@ function App() {
                         </div>
                     </div>
 
-                    <div className="glass-panel flex-1 p-2 overflow-y-auto font-mono text-sm custom-scrollbar">
-                        <div className="text-xs text-gray-600 mb-1 font-bold">FC EVENT LOGS</div>
+                    <div className="glass-panel flex-1 p-2 overflow-y-auto font-mono text-xs custom-scrollbar">
+                        <div className="text-[10px] text-slate-500 mb-1.5 font-bold uppercase tracking-wider">FC EVENT LOGS</div>
                         {fcLogs.length === 0
-                            ? <div className="text-gray-800 text-xs">— 尚無資料 —</div>
+                            ? <div className="text-slate-700 text-xs">— 尚無資料 —</div>
                             : (
-                                <table className="w-full text-left border-collapse text-xs">
+                                <table className="w-full text-left border-collapse text-[11px] font-mono">
                                     <thead>
-                                        <tr className="border-b border-gray-700/50 text-gray-500">
+                                        <tr className="border-b border-slate-800 text-slate-500">
                                             <th className="py-1 pr-2 w-16">Time</th>
                                             <th className="py-1">Event</th>
                                         </tr>
                                     </thead>
                                     <tbody>
                                         {fcLogs.map((log, i) => (
-                                            <tr key={i} className="border-b border-gray-800/30 hover:bg-gray-800/20">
-                                                <td className="py-1 pr-2 text-gray-500">{log.time}</td>
-                                                <td className="py-1 text-cyan-300">{log.msg}</td>
+                                            <tr key={i} className="border-b border-slate-900/30 hover:bg-slate-900/10">
+                                                <td className="py-1 pr-2 text-slate-500">{log.time}</td>
+                                                <td className={`py-1 ${getLogMsgColorClass(log.msg)}`}>{log.msg}</td>
                                             </tr>
                                         ))}
                                     </tbody>
@@ -562,10 +627,10 @@ function App() {
                     </div>
 
                     <div className="glass-panel p-2 overflow-y-auto custom-scrollbar" style={{height:"100px"}}>
-                        <div className="text-xs text-yellow-600 mb-1 font-bold uppercase">GND CMD Log</div>
+                        <div className="text-[10px] text-amber-500/80 mb-1 font-bold uppercase tracking-wider">GND CMD Log</div>
                         {cmdLog.length === 0
-                            ? <div className="text-gray-800 text-xs">— 等待操作 —</div>
-                            : cmdLog.map((m,i) => <div key={i} className="text-yellow-500/70 text-xs">{m}</div>)
+                            ? <div className="text-slate-800 text-xs">— 等待操作 —</div>
+                            : cmdLog.map((m,i) => <div key={i} className="text-amber-500/70 text-xs font-mono">{m}</div>)
                         }
                     </div>
                 </div>
@@ -573,23 +638,36 @@ function App() {
                 {/* 右側：狀態控制面板 */}
                 <div className="w-1/4 flex flex-col gap-3 relative">
                     {!isLive && (
-                        <div className="absolute inset-0 bg-black/80 z-20 flex items-center justify-center">
-                            <button onClick={() => setIsLive(true)} className="px-4 py-1 bg-yellow-600 text-black font-bold text-sm rounded">RETURN LIVE</button>
+                        <div className="absolute inset-0 bg-slate-950/80 z-20 flex items-center justify-center rounded-md">
+                            <button onClick={() => setIsLive(true)} className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-black font-bold text-xs rounded transition-colors tracking-wide uppercase">RETURN LIVE</button>
                         </div>
                     )}
 
                     {/* Mission Sequence */}
                     <div className="glass-panel flex flex-col overflow-hidden flex-1">
-                        <div className="p-2 bg-cyan-900/10 border-b border-cyan-900/20 text-sm font-bold text-cyan-500 uppercase">Mission Sequence</div>
-                        <div className="p-2 flex flex-col gap-2 overflow-y-auto custom-scrollbar flex-1">
-                            {normalNext.length === 0 && <div className="text-xs text-gray-700 text-center py-2 border border-dashed border-gray-800">NO NEXT STEP</div>}
+                        <div className="p-2 bg-slate-950/40 border-b border-slate-800/60 text-xs font-bold text-cyan-400 uppercase tracking-wider">Mission Control</div>
+                        
+                        {/* Current State LCD display */}
+                        <div className="p-2 px-2.5 m-2 lcd-panel flex flex-col gap-1.5">
+                            <span className="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Current State</span>
+                            <div className="flex justify-between items-center">
+                                <span className="text-xs font-mono text-cyan-400 font-bold">[{currStateId}] {currState.name}</span>
+                                <span className="text-[10px] bg-cyan-950/70 text-cyan-300 border border-cyan-800/40 px-1.5 py-0.5 rounded font-bold">{currState.label}</span>
+                            </div>
+                        </div>
+
+                        <div className="p-2 pt-0 flex flex-col gap-2 overflow-y-auto custom-scrollbar flex-1">
+                            <div className="text-[9px] text-slate-500 font-bold uppercase tracking-wider mb-1">Available Actions</div>
+                            {normalNext.length === 0 && debugNext.length === 0 && (
+                                <div className="text-xs text-slate-600 text-center py-4 border border-dashed border-slate-800 rounded">NO NEXT TRANSITION AVAILABLE</div>
+                            )}
                             {normalNext.map(s => (
-                                <button key={s.id} id={`btn-state-${s.id}`} onClick={() => sendStateCommand(s.id)} className="btn-base btn-sequence w-full py-2">
+                                <button key={s.id} id={`btn-state-${s.id}`} onClick={() => sendStateCommand(s.id)} className="btn-base btn-sequence w-full py-1.5 text-xs">
                                     [{s.id}] {s.label}
                                 </button>
                             ))}
                             {debugNext.map(s => (
-                                <button key={s.id} id={`btn-state-${s.id}`} onClick={() => sendStateCommand(s.id)} className="btn-base btn-debug w-full py-1.5">
+                                <button key={s.id} id={`btn-state-${s.id}`} onClick={() => sendStateCommand(s.id)} className="btn-base btn-debug w-full py-1.5 text-[11px]">
                                     [{s.id}] {s.label}
                                 </button>
                             ))}
@@ -598,23 +676,29 @@ function App() {
 
                     {/* Critical Operations */}
                     <div className="glass-panel flex flex-col overflow-hidden" style={{minHeight:"150px"}}>
-                        <div className="p-2 bg-red-900/5 border-b border-red-900/20 text-sm font-bold text-red-500 uppercase">⚠ Critical Operations</div>
-                        <div className="p-2 flex flex-col gap-2 flex-1">
+                        <div className="p-2 bg-red-950/20 border-b border-red-900/20 text-xs font-bold text-red-500 uppercase tracking-wider">⚠ Critical Operations</div>
+                        <div className="p-2 flex flex-col gap-2 flex-1 justify-center">
                             {criticalNext.map(s => (
-                                <button key={s.id} id={`btn-state-${s.id}`} onClick={() => sendStateCommand(s.id)} className="btn-base btn-emergency w-full py-3">
+                                <button key={s.id} id={`btn-state-${s.id}`} onClick={() => sendStateCommand(s.id)} className="btn-base btn-emergency w-full py-2.5 text-xs">
                                     [{s.id}] {s.label}
                                 </button>
                             ))}
-                            {criticalNext.length === 0 && currStateId !== 14 && (
-                                <div className="text-xs text-gray-700 text-center py-2 border border-dashed border-gray-800">— 無緊急操作 —</div>
+                            {criticalNext.length === 0 && currStateId !== 9 && (
+                                <div className="text-xs text-slate-600 text-center py-4 border border-dashed border-slate-800 rounded">— 無緊急操作 —</div>
                             )}
-                            {currStateId === 14 && (
-                                <div className="text-xs text-red-900 text-center py-4 border border-dashed border-red-900">☠ MISSION TERMINATED</div>
+                            {currStateId === 9 && (
+                                <>
+                                    <div className="text-xs text-red-400 font-bold text-center py-2 border border-dashed border-red-900 rounded bg-red-950/10">☠ MISSION TERMINATED</div>
+                                    <button id="btn-reset-idle" onClick={() => sendStateCommand(0)}
+                                        className="btn-base btn-sequence w-full py-2 text-xs font-bold bg-amber-950/40 border border-amber-800/40 hover:bg-amber-900/40 text-amber-400 rounded transition-colors uppercase tracking-wider">
+                                        🔄 RESET TO IDLE [0]
+                                    </button>
+                                </>
                             )}
-                            {currStateId !== 14 && (
-                                <button id="btn-force-terminate" onClick={() => sendStateCommand(14)}
-                                    className="btn-base btn-emergency w-full py-1.5 mt-auto opacity-50 hover:opacity-100 text-sm">
-                                    ☠ FORCE TERMINATE [14]
+                            {currStateId !== 9 && (
+                                <button id="btn-force-terminate" onClick={() => sendStateCommand(9)}
+                                    className="btn-base btn-emergency w-full py-1.5 mt-auto opacity-50 hover:opacity-100 text-xs transition-opacity duration-300">
+                                    ☠ FORCE TERMINATE [9]
                                 </button>
                             )}
                         </div>
@@ -624,52 +708,52 @@ function App() {
 
             {/* Timeline Scrubber */}
             <div className="glass-panel p-2 flex items-center gap-3 h-9 shrink-0">
-                <span className="text-xs text-gray-600 shrink-0">TIMELINE</span>
+                <span className="text-[10px] text-slate-500 font-bold tracking-wider shrink-0">TIMELINE</span>
                 <input type="range" min="0" max={Math.max(0, history.length-1)} value={histIdx}
                     onChange={e => { setIsLive(false); setHistIdx(parseInt(e.target.value)); }}
-                    className="w-full h-1" />
-                <span className="text-xs text-cyan-400 shrink-0 font-bold tracking-widest whitespace-nowrap">
+                    className="w-full h-1 cyber-slider" />
+                <span className="text-xs text-cyan-400 shrink-0 font-mono font-bold tracking-wider whitespace-nowrap bg-slate-950/80 px-2 py-0.5 border border-slate-800 rounded">
                     SEQ: {currentPkt} ({currentScrubberTsSec.toFixed(1)}s)
                 </span>
                 
                 {/* CSV Export Controls */}
-                <button onClick={() => setShowExport(!showExport)} className="px-2 py-0.5 bg-blue-900/50 text-blue-400 border border-blue-700 rounded text-xs font-bold hover:bg-blue-800/50 transition-colors">
+                <button onClick={() => setShowExport(!showExport)} className="px-2.5 py-0.5 bg-slate-950/80 text-slate-300 border border-slate-800 rounded text-xs font-bold hover:text-cyan-400 hover:border-cyan-800 transition-colors">
                     CSV
                 </button>
                 {showExport && (
-                    <div className="flex items-center gap-2 border-l border-gray-700 pl-2 shrink-0">
-                        <input type="number" value={exportStart} onChange={e => setExportStart(Number(e.target.value))} className="w-14 bg-black/80 text-cyan-400 border border-cyan-900 text-xs px-1 outline-none text-center rounded" placeholder="Start" title="Start Time (s)" />
-                        <span className="text-gray-500 text-xs">-</span>
-                        <input type="number" value={exportEnd} onChange={e => setExportEnd(Number(e.target.value))} className="w-14 bg-black/80 text-cyan-400 border border-cyan-900 text-xs px-1 outline-none text-center rounded" placeholder="End" title="End Time (s)" />
-                        <span className="text-gray-500 text-xs">s</span>
-                        <button onClick={() => downloadCSV(exportStart, exportEnd)} className="px-3 py-0.5 bg-green-900/50 text-green-400 border border-green-700 rounded text-xs font-bold hover:bg-green-800/50 transition-colors ml-1">
-                            匯出
+                    <div className="flex items-center gap-2 border-l border-slate-800 pl-2 shrink-0">
+                        <input type="number" value={exportStart} onChange={e => setExportStart(Number(e.target.value))} className="w-14 bg-slate-950 text-cyan-400 border border-slate-800 text-xs px-1.5 py-0.5 outline-none text-center rounded font-mono" placeholder="Start" title="Start Time (s)" />
+                        <span className="text-slate-600 text-xs">-</span>
+                        <input type="number" value={exportEnd} onChange={e => setExportEnd(Number(e.target.value))} className="w-14 bg-slate-950 text-cyan-400 border border-slate-800 text-xs px-1.5 py-0.5 outline-none text-center rounded font-mono" placeholder="End" title="End Time (s)" />
+                        <span className="text-slate-500 text-[10px] uppercase font-bold">sec</span>
+                        <button onClick={() => downloadCSV(exportStart, exportEnd)} className="px-3 py-0.5 bg-cyan-950 text-cyan-400 border border-cyan-800/80 rounded text-xs font-bold hover:bg-cyan-800 hover:text-white transition-colors ml-1">
+                            EXPORT
                         </button>
                     </div>
                 )}
             </div>
 
-            {/* WebSocket Manager Modal */}
+            {/* MQTT Manager Modal */}
             {showWsModal && (
                 <div className="absolute inset-0 bg-black/80 z-50 flex items-center justify-center">
                     <div className="glass-panel p-4 max-w-md w-full flex flex-col gap-3">
-                        <h3 className="text-cyan-400 font-bold uppercase border-b border-cyan-900 pb-2">📡 追蹤多個地面站 WebSocket</h3>
-                        <p className="text-xs text-gray-400 mb-2">可新增多個 Ground Station IP，系統將根據封包編號自動過濾重複資料，防止掉包斷線。</p>
+                        <h3 className="text-cyan-400 font-bold uppercase border-b border-cyan-900 pb-2">📡 追蹤多個 MQTT Broker</h3>
+                        <p className="text-xs text-gray-400 mb-2">可新增多個 Ground Station 內建的 MQTT Broker，系統將根據封包編號自動過濾重複資料，防止掉包斷線。</p>
                         
                         <div className="flex flex-col gap-2 max-h-60 overflow-y-auto custom-scrollbar pr-1">
-                            {wsUrls.map((url, i) => (
+                            {mqttUrls.map((url, i) => (
                                 <div key={i} className="flex gap-2 items-center bg-black/40 p-1.5 rounded border border-gray-800">
-                                    <div className={`w-2.5 h-2.5 rounded-full ${wsStatuses[url] ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-red-500 shadow-[0_0_8px_#ef4444]'}`}></div>
+                                    <div className={`w-2.5 h-2.5 rounded-full ${mqttStatuses[url] ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-red-500 shadow-[0_0_8px_#ef4444]'}`}></div>
                                     <input type="text" value={url} readOnly className="flex-1 bg-transparent border-none outline-none text-xs text-gray-300 font-mono" />
                                     <button onClick={() => {
-                                        setWsUrls(urls => urls.filter((_, idx) => idx !== i));
+                                        setMqttUrls(urls => urls.filter((_, idx) => idx !== i));
                                     }} className="px-2 py-1 bg-red-900/30 hover:bg-red-900/80 text-red-400 text-xs rounded border border-red-800 transition-colors">移除</button>
                                 </div>
                             ))}
                         </div>
                         
                         <div className="flex gap-2 mt-2">
-                            <input type="text" id="new-ws-url" placeholder={`ws://${window.location.hostname || "192.168.x.x"}:8765`} className="flex-1 bg-black/80 border border-cyan-900 focus:border-cyan-500 outline-none text-cyan-400 text-xs px-2 py-1.5 rounded font-mono" 
+                            <input type="text" id="new-ws-url" placeholder={`ws://${window.location.hostname || "192.168.x.x"}:9001`} className="flex-1 bg-black/80 border border-cyan-900 focus:border-cyan-500 outline-none text-cyan-400 text-xs px-2 py-1.5 rounded font-mono" 
                                 onKeyDown={(e) => {
                                     if (e.key === 'Enter') document.getElementById('btn-add-ws').click();
                                 }}
@@ -677,8 +761,8 @@ function App() {
                             <button id="btn-add-ws" onClick={() => {
                                 const input = document.getElementById('new-ws-url');
                                 const val = input.value.trim();
-                                if (val && !wsUrls.includes(val)) {
-                                    setWsUrls(urls => [...urls, val]);
+                                if (val && !mqttUrls.includes(val)) {
+                                    setMqttUrls(urls => [...urls, val]);
                                     input.value = '';
                                 }
                             }} className="px-4 py-1.5 bg-cyan-900/50 hover:bg-cyan-800 text-cyan-400 text-xs font-bold rounded border border-cyan-700 transition-colors">新增</button>

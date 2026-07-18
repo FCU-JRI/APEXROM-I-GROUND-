@@ -19,8 +19,6 @@ import serial.tools.list_ports
 import threading
 import struct
 import json
-import asyncio
-import websockets
 import queue
 import time
 import math
@@ -33,8 +31,8 @@ def choose_serial_port():
     if os.environ.get("SERIAL_PORT"):
         return os.environ.get("SERIAL_PORT")
         
-    # 若有帶入命令列參數，優先使用
-    if len(sys.argv) > 1:
+    # 若有帶入命令列參數且不是 flags，優先使用
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
         return sys.argv[1]
         
     ports = serial.tools.list_ports.comports()
@@ -55,10 +53,25 @@ def choose_serial_port():
         
     return choice
 
-# WebSocket 廣播機制
-ws_clients = set()
-ws_loop    = None
-_ser_global = None  # 由 main() 設定，供 ws_handler 轉發指令至 Serial
+_ser_global = None  # 由 main() 設定，供 mqtt_on_message 轉發指令至 Serial
+current_board_freq = None  # 目前板子的頻率 (Hz)
+desired_board_freq = None  # 使用者設定的目標頻率 (Hz)
+
+# 連接埠硬體特徵追蹤
+target_vid = None
+target_pid = None
+target_description = None
+target_serial_number = None
+
+def publish_status_update():
+    try:
+        payload_str = json.dumps({
+            "type": "status",
+            "board_freq": current_board_freq
+        })
+        mqtt_client.publish(TOPIC_TELEMETRY, payload_str)
+    except Exception as e:
+        print(f"⚠️ Status publish failed: {e}")
 
 # STATENUM 合法範圍（對應 StateMachine.hpp enum）
 _VALID_STATE_IDS = set(range(14))  # 0–13
@@ -68,52 +81,81 @@ def clean_float(val):
         return 0.0
     return val
 
-async def ws_handler(websocket):
-    """雙向 WebSocket handler：
-    - 下行（FC→GND）：由 broadcast_ws 主動推送感測資料
-    - 上行（GND→FC）：接收地面端指令並轉發至 Serial
-    """
-    ws_clients.add(websocket)
+import paho.mqtt.client as mqtt
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--mqtt-ip", default="127.0.0.1", help="MQTT Broker IP")
+args = parser.parse_args()
+
+# --- MQTT 設定 ---
+MQTT_BROKER = args.mqtt_ip
+MQTT_PORT = 1883
+TOPIC_TELEMETRY = "fc/telemetry"
+TOPIC_CMD = "fc/cmd"
+
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2) if hasattr(mqtt, 'CallbackAPIVersion') else mqtt.Client()
+
+def on_connect(client, userdata, flags, rc, *args):
+    print(f"\n✅ MQTT 連線成功! 準備接收前端指令...")
+    client.subscribe(TOPIC_CMD)
+
+def on_disconnect(client, userdata, flags, rc, *args):
+    print(f"⚠️ MQTT 連線中斷 (RC: {rc})，正在自動嘗試重新連線...", flush=True)
+
+def on_message(client, userdata, msg):
+    global desired_board_freq
     try:
-        async for raw in websocket:
-            try:
-                msg = json.loads(raw)
-                if msg.get("type") == "cmd" and msg.get("action") == "setState":
-                    state_id = int(msg["stateId"])
-                    if state_id not in _VALID_STATE_IDS:
-                        print(f"[WS→Serial] ❌ 非法狀態碼：{state_id}", flush=True)
-                        continue
+        payload = json.loads(msg.payload.decode('utf-8'))
+        if payload.get("type") == "cmd":
+            action = payload.get("action")
+            if action == "setState":
+                state_id = int(payload["stateId"])
+                if state_id not in _VALID_STATE_IDS:
+                    print(f"[MQTT→Serial] ❌ 非法狀態碼：{state_id}", flush=True)
+                    return
+                if _ser_global and _ser_global.is_open:
+                    serial_cmd_queue.put(f"{state_id}\n".encode('utf-8'))
+                    print(f"[MQTT→Serial] 📡 切換指令發送：State {state_id}", flush=True)
+                else:
+                    print("[MQTT→Serial] ⚠️ Serial port 未開啟，指令丟棄", flush=True)
+            elif action == "setFreq":
+                freq = int(payload["frequency"])
+                if freq in [433000000, 915000000]:
+                    desired_board_freq = freq
                     if _ser_global and _ser_global.is_open:
-                        serial_cmd_queue.put(f"{state_id}\n".encode('utf-8'))
-                        print(f"[WS→Serial] 📡 切換指令發送：State {state_id}", flush=True)
+                        serial_cmd_queue.put(f"SET_FREQ:{freq}\n".encode('utf-8'))
+                        print(f"[MQTT→Serial] 📡 切換頻率指令發送：{freq} Hz", flush=True)
                     else:
-                        print("[WS→Serial] ⚠️ Serial port 未開啟，指令丟棄", flush=True)
-            except Exception as e:
-                print(f"[WS CMD] ❌ 內容解析錯誤：{e}", flush=True)
-    except websockets.exceptions.ConnectionClosed:
-        pass # 客戶端正常斷線
+                        print("[MQTT→Serial] ⚠️ Serial port 未開啟，指令丟棄", flush=True)
+                else:
+                    print(f"[MQTT→Serial] ❌ 非法頻率：{freq}", flush=True)
+            elif action == "queryFreq":
+                if current_board_freq is not None:
+                    publish_status_update()
+                if _ser_global and _ser_global.is_open:
+                    serial_cmd_queue.put(b"REQ_FREQ\n")
+                    print("[MQTT→Serial] 📡 查詢頻率指令發送", flush=True)
     except Exception as e:
-        print(f"[WS] ⚠️ WebSocket 異常斷線：{e}", flush=True)
-    finally:
-        ws_clients.discard(websocket)
+        print(f"[MQTT CMD] ❌ 指令解析錯誤：{e}", flush=True)
 
-async def broadcast_ws(batch_data):
-    if ws_clients:
-        # Extract sequence number if present, otherwise use 0
-        seq_num = next((b["data"]["seq"] for b in batch_data if b["type"] == "SEQUENCE"), 0)
-        msg = json.dumps({"batch": batch_data, "status": "0-0", "pkt": seq_num})
-        print(f"[WS] Broadcasting to {len(ws_clients)} active clients...")
-        await asyncio.gather(*[client.send(msg) for client in ws_clients])
+mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
+mqtt_client.on_message = on_message
 
-async def _ws_main():
-    global ws_loop
-    ws_loop = asyncio.get_running_loop()
-    # 增加 ping 機制，剔除殭屍連線以防記憶體與效能流失
-    async with websockets.serve(ws_handler, "0.0.0.0", 8765, ping_interval=10, ping_timeout=5):
-        await asyncio.Future()  # 永久等待，直到 thread 結束
-
-def ws_server_thread():
-    asyncio.run(_ws_main())
+def start_mqtt():
+    def mqtt_connect_loop():
+        connected = False
+        while not connected:
+            try:
+                mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                mqtt_client.loop_start() # 背景執行緒接收/發送 MQTT
+                print(f"✅ MQTT 連線成功，開始監聽 {MQTT_BROKER}:{MQTT_PORT}", flush=True)
+                connected = True
+            except Exception as e:
+                print(f"❌ 無法連線至 MQTT Broker ({MQTT_BROKER}): {e}，5 秒後重試...", flush=True)
+                time.sleep(5)
+    threading.Thread(target=mqtt_connect_loop, daemon=True).start()
 
 def build_event_string(event_id, p1, p2, p3):
     EVENT_MAP = {
@@ -148,9 +190,17 @@ def build_event_string(event_id, p1, p2, p3):
     return EVENT_MAP.get(event_id, f"Unknown Event {event_id} ({p1:.2f}, {p2:.2f}, {p3:.2f})")
 
 rf_buffer = bytearray()
+_last_print_times = {}
 
-def parse_rf_buffer():
-    global rf_buffer
+def rate_limit_print(key, text, min_interval=0.2):
+    now = time.time()
+    last = _last_print_times.get(key, 0)
+    if now - last >= min_interval:
+        print(text, flush=True)
+        _last_print_times[key] = now
+
+def parse_rf_buffer(rssi=0):
+    global rf_buffer, current_board_freq
     batch_data = []
     offset = 0
     parsed_count = 0
@@ -164,7 +214,7 @@ def parse_rf_buffer():
             if len(rf_buffer) - offset < 24: break
             event_id, p1, p2, p3 = struct.unpack_from('<B3xfff', rf_buffer, offset + 8)
             msg = build_event_string(event_id, p1, p2, p3)
-            print(f"  📝 [LOG] {ts}ms: {msg}")
+            print(f"  [LOG] {ts}ms: {msg}", flush=True)
             batch_data.append({"type": "LOG", "ts": ts, "data": {"msg": msg}})
             offset += 24
             parsed_count += 1
@@ -177,7 +227,7 @@ def parse_rf_buffer():
             ax, ay, az, gx, gy, gz = struct.unpack_from('<6f', rf_buffer, offset + 8)
             ax, ay, az = clean_float(ax), clean_float(ay), clean_float(az)
             gx, gy, gz = clean_float(gx), clean_float(gy), clean_float(gz)
-            print(f"  🔹 [IMU] {ts}ms: Acc=({ax:.2f}, {ay:.2f}, {az:.2f}) Gyro=({gx:.2f}, {gy:.2f}, {gz:.2f})")
+            rate_limit_print("IMU", f"  [IMU] {ts}ms: Acc=({ax:.2f}, {ay:.2f}, {az:.2f}) Gyro=({gx:.2f}, {gy:.2f}, {gz:.2f})")
             batch_data.append({"type": "IMU", "ts": ts, "data": {"ax":ax, "ay":ay, "az":az, "gx":gx, "gy":gy, "gz":gz}})
             offset += 32
             parsed_count += 1
@@ -188,7 +238,7 @@ def parse_rf_buffer():
             ax, ay, az = clean_float(ax), clean_float(ay), clean_float(az)
             gx, gy, gz = clean_float(gx), clean_float(gy), clean_float(gz)
             mx, my, mz = clean_float(mx), clean_float(my), clean_float(mz)
-            print(f"  🔹 [IMU_MAG] {ts}ms: Acc=({ax:.2f}, {ay:.2f}, {az:.2f}) Gyro=({gx:.2f}, {gy:.2f}, {gz:.2f}) Mag=({mx:.2f}, {my:.2f}, {mz:.2f})")
+            rate_limit_print("IMU_MAG", f"  [IMU_MAG] {ts}ms: Acc=({ax:.2f}, {ay:.2f}, {az:.2f}) Gyro=({gx:.2f}, {gy:.2f}, {gz:.2f}) Mag=({mx:.2f}, {my:.2f}, {mz:.2f})")
             batch_data.append({"type": "IMU", "ts": ts, "data": {"ax":ax, "ay":ay, "az":az, "gx":gx, "gy":gy, "gz":gz, "mx":mx, "my":my, "mz":mz}})
             offset += 44
             parsed_count += 1
@@ -197,7 +247,7 @@ def parse_rf_buffer():
             if len(rf_buffer) - offset < 16: break
             pressure, temp = struct.unpack_from('<2f', rf_buffer, offset + 8)
             pressure, temp = clean_float(pressure), clean_float(temp)
-            print(f"  ☁️ [BMP] {ts}ms: Press={pressure:.2f}hPa, Temp={temp:.2f}°C")
+            rate_limit_print("BMP", f"  [BMP] {ts}ms: Press={pressure:.2f}hPa, Temp={temp:.2f}°C")
             batch_data.append({"type": "BMP", "ts": ts, "data": {"pressure": pressure, "temp": temp}})
             offset += 16
             parsed_count += 1
@@ -206,7 +256,7 @@ def parse_rf_buffer():
             if len(rf_buffer) - offset < 32: break
             lat, lon, alt = struct.unpack_from('<ddf', rf_buffer, offset + 8)
             lat, lon, alt = clean_float(lat), clean_float(lon), clean_float(alt)
-            print(f"  📍 [GPS] {ts}ms: Lat={lat:.6f}, Lon={lon:.6f}, Alt={alt:.2f}m")
+            rate_limit_print("GPS", f"  [GPS] {ts}ms: Lat={lat:.6f}, Lon={lon:.6f}, Alt={alt:.2f}m")
             batch_data.append({"type": "GPS", "ts": ts, "data": {"lat": lat, "lon": lon, "alt": alt}})
             offset += 32
             parsed_count += 1
@@ -215,7 +265,7 @@ def parse_rf_buffer():
             if len(rf_buffer) - offset < 24: break
             qw, qx, qy, qz = struct.unpack_from('<ffff', rf_buffer, offset + 8)
             qw, qx, qy, qz = clean_float(qw), clean_float(qx), clean_float(qy), clean_float(qz)
-            print(f"  [QUAT] {ts}ms: w={qw:.3f}, x={qx:.3f}, y={qy:.3f}, z={qz:.3f}")
+            rate_limit_print("QUAT", f"  [QUAT] {ts}ms: w={qw:.3f}, x={qx:.3f}, y={qy:.3f}, z={qz:.3f}")
             batch_data.append({"type": "KALMAN_QUATERNION", "ts": ts, "data": {"q": [qw, qx, qy, qz]}})
             offset += 24
             parsed_count += 1
@@ -224,7 +274,7 @@ def parse_rf_buffer():
             if len(rf_buffer) - offset < 20: break
             alt, vz, az = struct.unpack_from('<fff', rf_buffer, offset + 8)
             alt, vz, az = clean_float(alt), clean_float(vz), clean_float(az)
-            print(f"  🚀 [KF_ALT] {ts}ms: Alt={alt:.2f}m, Vz={vz:.2f}m/s, Az={az:.2f}m/s²")
+            rate_limit_print("KF_ALT", f"  [KF_ALT] {ts}ms: Alt={alt:.2f}m, Vz={vz:.2f}m/s, Az={az:.2f}m/s²")
             batch_data.append({"type": "KALMAN_ALTITUDE", "ts": ts, "data": {"alt":alt, "vz":vz, "az":az}})
             offset += 20
             parsed_count += 1
@@ -243,7 +293,7 @@ def parse_rf_buffer():
             parsed_count += 1
             
         else:
-            print(f"  [UNKNOWN] Type ID: {pkt_type} at offset {offset}")
+            rate_limit_print("UNKNOWN", f"  [UNKNOWN] Type ID: {pkt_type} at offset {offset}")
             offset += 1 # 略過一個 byte 嘗試重新對齊
             
     # 從緩衝區移除已解析的部分
@@ -259,23 +309,43 @@ def parse_rf_buffer():
             # 硬碟強制落地寫入 (避免前端當機導致資料遺失)
             try:
                 with open(JSON_LOG_FILE, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"batch": batch_data, "ts_local": time.time()}) + "\n")
+                    f.write(json.dumps({"batch": batch_data, "ts_local": time.time(), "rssi": rssi, "board_freq": current_board_freq}) + "\n")
             except Exception as e:
                 print(f"⚠️ 硬碟日誌寫入失敗: {e}")
                 
-        if batch_data and ws_loop:
-            asyncio.run_coroutine_threadsafe(broadcast_ws(batch_data), ws_loop)
+                
+            # MQTT 推送
+            try:
+                seq_num = next((b["data"]["seq"] for b in batch_data if b["type"] == "SEQUENCE"), 0)
+                payload_str = json.dumps({
+                    "batch": batch_data, 
+                    "status": "0-0", 
+                    "pkt": seq_num, 
+                    "rssi": rssi,
+                    "board_freq": current_board_freq
+                })
+                mqtt_client.publish(TOPIC_TELEMETRY, payload_str)
+            except Exception as e:
+                print(f"⚠️ MQTT 推送失敗: {e}")
 
 
 def read_from_port():
-    global rf_buffer, _ser_global
+    global rf_buffer, _ser_global, current_board_freq
+    last_query_time = 0
     while True:
         try:
             if _ser_global and _ser_global.is_open:
+                # 定期查詢頻率 (每 10 秒，或者尚未偵測到時)
+                now = time.time()
+                if current_board_freq is None or now - last_query_time > 10:
+                    serial_cmd_queue.put(b"REQ_FREQ\n")
+                    last_query_time = now
+
                 # 優先處理待發送指令
                 while not serial_cmd_queue.empty():
                     cmd = serial_cmd_queue.get_nowait()
                     _ser_global.write(cmd)
+                    _ser_global.flush()
 
                 if _ser_global.in_waiting > 0:
                     line = _ser_global.readline().decode('utf-8', errors='ignore').strip()
@@ -288,16 +358,31 @@ def read_from_port():
                         except:
                             pass
                     
-                    if "Wired Telemetry Data:" in line:
+                    # 偵測板子頻率回應
+                    if "CURRENT_FREQ:" in line:
                         try:
-                            print("\n==================== NEW LORA CHUNK ====================")
-                            hex_str = line.split("Wired Telemetry Data:")[1].strip()
+                            freq_str = line.split("CURRENT_FREQ:")[1].strip()
+                            freq_val = int(freq_str)
+                            if freq_val != current_board_freq:
+                                current_board_freq = freq_val
+                                print(f"📡 偵測到板子目前頻率: {current_board_freq} Hz")
+                                publish_status_update()
+                        except Exception as e:
+                            print(f"解析頻率錯誤: {e}")
+
+                    elif "Wired Telemetry Data:" in line:
+                        try:
+                            rate_limit_print("LORA_CHUNK", "\n==================== NEW LORA CHUNK ====================", min_interval=1.0)
+                            parts = line.split("Wired Telemetry Data:")[1].split("RSSI:")
+                            hex_str = parts[0].strip()
+                            rssi = int(parts[1].strip()) if len(parts) > 1 else None
+                            
                             hex_list = hex_str.split()
                             byte_data = bytes([int(x, 16) for x in hex_list])
                             rf_buffer.extend(byte_data)
                             
                             # 呼叫解析函式
-                            parse_rf_buffer()
+                            parse_rf_buffer(rssi)
                         except Exception as e:
                             print(f"  -> [解析錯誤] {e}")
                     elif line:
@@ -309,23 +394,63 @@ def read_from_port():
         except (serial.SerialException, OSError) as e:
             print(f"\n❌ [硬體異常斷線] Serial Error: {e}")
             if _ser_global:
-                _ser_global.close()
+                try:
+                    _ser_global.close()
+                except Exception:
+                    pass
             # 進入自動重連迴圈
             while True:
                 try:
                     time.sleep(2)
-                    print(f"🔄 嘗試重新連線至 {_ser_global.port} ...")
-                    _ser_global.open()
-                    print(f"✅ 成功重新連線至 {_ser_global.port}!")
-                    break
-                except Exception:
-                    pass
+                    ports = serial.tools.list_ports.comports()
+                    found_port = None
+                    
+                    # 1. 優先嘗試用相同的 port 裝置路徑
+                    if any(p.device == _ser_global.port for p in ports):
+                        found_port = _ser_global.port
+                    
+                    # 2. 如果原本的路徑不見了，嘗試使用相同的 VID/PID 找回
+                    if not found_port and target_vid is not None and target_pid is not None:
+                        for p in ports:
+                            if p.vid == target_vid and p.pid == target_pid:
+                                if target_serial_number and p.serial_number != target_serial_number:
+                                    continue
+                                found_port = p.device
+                                break
+                                
+                    # 3. 如果還是找不到，但有類似 usbserial/usbmodem 的埠，自動選取它
+                    if not found_port:
+                        usb_ports = [p.device for p in ports if "usb" in p.device.lower() or "serial" in p.device.lower() or "usbmodem" in p.device.lower()]
+                        if usb_ports:
+                            found_port = usb_ports[0]
+
+                    if found_port:
+                        if _ser_global.port != found_port:
+                            print(f"⚠️ 原連接埠 {_ser_global.port} 已變更，自動切換至新埠: {found_port}")
+                            _ser_global.port = found_port
+                        
+                        print(f"🔄 嘗試重新連線至 {_ser_global.port} ...")
+                        _ser_global.dtr = False
+                        _ser_global.rts = False
+                        _ser_global.open()
+                        print(f"✅ 成功重新連線至 {_ser_global.port}!")
+                        
+                        # 斷電重啟防護：自動改回斷電前設定的目標頻率
+                        if desired_board_freq is not None:
+                            print(f"🛡️ 斷電重啟防護：正在同步發送設定頻率指令 ({desired_board_freq / 1000000} MHz)")
+                            serial_cmd_queue.put(f"SET_FREQ:{desired_board_freq}\n".encode('utf-8'))
+                        else:
+                            serial_cmd_queue.put(b"REQ_FREQ\n")
+                        break
+                except Exception as ex:
+                    print(f"連線失敗，繼續重試: {ex}")
         except Exception as e:
             print(f"\n❌ [未預期錯誤] read_from_port: {e}")
             time.sleep(1)
 
 def write_to_port(ser):
-    from prompt_toolkit import prompt
+    import sys
+    from prompt_toolkit import PromptSession
     from prompt_toolkit.patch_stdout import patch_stdout
 
     print("=======================================")
@@ -333,36 +458,53 @@ def write_to_port(ser):
     print("輸入 'exit' 離開程式")
     print("=======================================\n")
     
-    with patch_stdout():
-        while True:
-            try:
-                user_input = prompt("指令 > ")
-                if user_input.lower() == 'exit':
-                    print("Exiting...")
-                    ser.close()
-                    sys.exit(0)
-                
-                if user_input.upper() == 'T':
-                    print(">> [傳送] Force Terminate Command ('T')")
-                    serial_cmd_queue.put(b'T\n')
-                elif user_input.strip() != "":
-                    serial_cmd_queue.put((user_input + '\n').encode('utf-8'))
-            except KeyboardInterrupt:
-                print("\nExiting...")
+    session = PromptSession()
+    
+    while True:
+        try:
+            with patch_stdout():
+                user_input = session.prompt('Command > ').strip()
+            
+            if user_input.lower() == 'exit':
+                print("Exiting...")
                 ser.close()
                 sys.exit(0)
-            except EOFError:
-                import time
-                time.sleep(1)
-                continue
-            except Exception as e:
-                print(f"Input error: {e}")
-                break
+            
+            if user_input.upper() == 'T':
+                print(">> [傳送] Force Terminate Command ('T')")
+                serial_cmd_queue.put(b'T\n')
+            elif user_input != "":
+                serial_cmd_queue.put((user_input + '\n').encode('utf-8'))
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            ser.close()
+            sys.exit(0)
+        except EOFError:
+            print("\nExiting...")
+            ser.close()
+            sys.exit(0)
+        except Exception as e:
+            print(f"Input error: {e}")
+            break
 
 def main():
-    global _ser_global
+    global _ser_global, target_vid, target_pid, target_description, target_serial_number
     serial_port = choose_serial_port()
     try:
+        # 尋找匹配的連接埠硬體資訊以供重連使用
+        try:
+            ports = serial.tools.list_ports.comports()
+            for p in ports:
+                if p.device == serial_port:
+                    target_vid = p.vid
+                    target_pid = p.pid
+                    target_description = p.description
+                    target_serial_number = p.serial_number
+                    print(f"📡 已記錄連接埠硬體資訊: VID={hex(p.vid) if p.vid else 'None'}, PID={hex(p.pid) if p.pid else 'None'}, Desc='{p.description}'")
+                    break
+        except Exception as e:
+            print(f"⚠️ 無法讀取連接埠硬體資訊: {e}")
+
         ser = serial.Serial()
         ser.port = serial_port
         ser.baudrate = BAUD_RATE
@@ -386,9 +528,9 @@ def main():
         print(f"成功連接 {serial_port} @ {BAUD_RATE} baud.")
         
         
-        # 啟動 WebSocket 伺服器
-        threading.Thread(target=ws_server_thread, daemon=True).start()
-        print("WebSocket Server started at ws://localhost:8765")
+        # 啟動 MQTT
+        start_mqtt()
+        print("📡 Ground Station Broker is listening on port 1883 (TCP) and 9001 (WebSockets)", flush=True)
         
         def serve_http():
             import http.server
