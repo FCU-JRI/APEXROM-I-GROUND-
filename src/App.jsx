@@ -80,7 +80,7 @@ function App() {
     const [showExport,  setShowExport]  = useState(false);
     const [exportStart, setExportStart] = useState(0);
     const [exportEnd,   setExportEnd]   = useState(600);
-    const [boardFreq,   setBoardFreq]   = useState(null);
+    const [boardFreq,   setBoardFreq]   = useState(433000000);
     const mqttRefs = useRef({});
     const seenPkts = useRef(new Set());
 
@@ -105,8 +105,8 @@ function App() {
                 if (isMounted) { 
                     setMqttStatuses(prev => ({ ...prev, [url]: true }));  
                     addCmdLog(`✅ 已連線至 MQTT Broker: ${url}`); 
-                    client.subscribe('fc/telemetry');
-                    client.publish('fc/cmd', JSON.stringify({ type: "cmd", action: "queryFreq" }));
+                    client.subscribe('fc/telemetry/+');
+                    client.publish('fc/cmd/all', JSON.stringify({ type: "cmd", action: "queryFreq" }));
                 } 
             });
             client.on('offline', () => { 
@@ -117,19 +117,24 @@ function App() {
             });
             client.on('error', () => {});
             client.on('message', (topic, message) => {
-                if (!isMounted || topic !== 'fc/telemetry') return;
+                if (!isMounted || !topic.startsWith('fc/telemetry/')) return;
+                
+                // 取得當前設定的頻道 (boardFreq, 預設若為 null 就假定為 433000000)
+                // 在閉包中我們直接使用 state 會拿到舊值，所以要透過 prev / 最新狀態，
+                // 但為了簡單，我們透過 useEffect 重新綁定，或使用 useRef 追蹤。
+                // 這裡我們先依賴外部的 boardFreq 變數
+                const currentActiveChannel = boardFreq || 433000000;
+                const topicSuffix = topic.split('/')[2];
+                if (topicSuffix !== 'unknown' && topicSuffix !== String(currentActiveChannel / 1000000)) {
+                    return; // 不是目前選擇的頻道，拋棄資料
+                }
+
                 try {
                     const d = JSON.parse(message.toString());
                     if (d.type === 'status') {
-                        if (d.board_freq !== undefined && d.board_freq !== null) {
-                            setBoardFreq(d.board_freq);
-                        }
                         return;
                     }
                     if (d.batch) {
-                        if (d.board_freq !== undefined && d.board_freq !== null) {
-                            setBoardFreq(d.board_freq);
-                        }
                         const pktId = d.pkt !== undefined ? d.pkt : Math.max(...d.batch.map(b => b.ts || 0));
                         if (seenPkts.current.has(pktId)) return; // 發現重複封包，丟棄以去重
                         seenPkts.current.add(pktId);
@@ -206,7 +211,9 @@ function App() {
         let sentCount = 0;
         Object.values(mqttRefs.current).forEach(client => {
             if (client && client.connected) {
-                client.publish('fc/cmd', JSON.stringify({ type:"cmd", action:"setState", stateId }));
+                // 發送指令至特定頻道的 Topic
+                const currentFreqMHz = (boardFreq || 433000000) / 1000000;
+                client.publish(`fc/cmd/${currentFreqMHz}`, JSON.stringify({ type:"cmd", action:"setState", stateId }));
                 sentCount++;
             }
         });
@@ -219,19 +226,25 @@ function App() {
     }, [addCmdLog]);
 
     const handleSetFreq = useCallback((freq) => {
+        // 切換 UI 顯示的頻道
+        setBoardFreq(freq);
+        
+        // 清空歷史資料與圖表
+        setHistory([]);
+        setHistIdx(0);
+        setFcLogs([]);
+        setStateEvents([]);
+        seenPkts.current.clear();
+        addCmdLog(`🔄 已切換顯示頻道至: ${freq / 1000000} MHz，舊資料已清空`);
+
+        // (可選) 仍然發送硬體切換指令至對應的頻道
         let sentCount = 0;
         Object.values(mqttRefs.current).forEach(client => {
             if (client && client.connected) {
-                client.publish('fc/cmd', JSON.stringify({ type: "cmd", action: "setFreq", frequency: freq }));
+                client.publish(`fc/cmd/${freq / 1000000}`, JSON.stringify({ type: "cmd", action: "setFreq", frequency: freq }));
                 sentCount++;
             }
         });
-
-        if (sentCount > 0) {
-            addCmdLog(`📡 [GND→RX] 發送切換頻率指令: ${freq / 1000000} MHz`);
-        } else {
-            addCmdLog("❌ 無任何 MQTT 連線，無法發送切換頻率指令");
-        }
     }, [addCmdLog]);
 
     // 衍生資料

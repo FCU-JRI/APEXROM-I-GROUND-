@@ -69,7 +69,8 @@ def publish_status_update():
             "type": "status",
             "board_freq": current_board_freq
         })
-        mqtt_client.publish(TOPIC_TELEMETRY, payload_str)
+        topic = f"fc/telemetry/{current_board_freq // 1000000}" if current_board_freq else "fc/telemetry/unknown"
+        mqtt_client.publish(topic, payload_str)
     except Exception as e:
         print(f"⚠️ Status publish failed: {e}")
 
@@ -115,7 +116,7 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2) if hasattr(mqtt, 'Ca
 
 def on_connect(client, userdata, flags, rc, *args):
     print(f"\n✅ MQTT 連線成功! 準備接收前端指令...")
-    client.subscribe(TOPIC_CMD)
+    client.subscribe("fc/cmd/#")
 
 def on_disconnect(client, userdata, flags, rc, *args):
     print(f"⚠️ MQTT 連線中斷 (RC: {rc})，正在自動嘗試重新連線...", flush=True)
@@ -123,6 +124,13 @@ def on_disconnect(client, userdata, flags, rc, *args):
 def on_message(client, userdata, msg):
     global desired_board_freq
     try:
+        topic_parts = msg.topic.split('/')
+        if len(topic_parts) >= 3:
+            target_freq_mhz = topic_parts[2]
+            if target_freq_mhz.isdigit() and current_board_freq is not None:
+                if int(target_freq_mhz) != (current_board_freq // 1000000):
+                    return # 不是發給我們這台接收端的指令，直接忽略
+
         payload = json.loads(msg.payload.decode('utf-8'))
         if payload.get("type") == "cmd":
             action = payload.get("action")
@@ -341,7 +349,8 @@ def parse_rf_buffer(rssi=0):
                     "rssi": rssi,
                     "board_freq": current_board_freq
                 })
-                mqtt_client.publish(TOPIC_TELEMETRY, payload_str)
+                topic = f"fc/telemetry/{current_board_freq // 1000000}" if current_board_freq else "fc/telemetry/unknown"
+                mqtt_client.publish(topic, payload_str)
             except Exception as e:
                 print(f"⚠️ MQTT 推送失敗: {e}")
 
