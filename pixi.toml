@@ -24,6 +24,9 @@ depends-on = ["install-frontend"]
 cmd = "python start_prod.py"
 depends-on = ["build"]
 
+[tasks.mqtt]
+cmd = "mosquitto -c mosquitto.conf"
+
 [dependencies]
 python = ">=3.14.6,<3.15"
 pyserial = ">=3.5,<4"

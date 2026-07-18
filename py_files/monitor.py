@@ -84,12 +84,29 @@ def clean_float(val):
 import paho.mqtt.client as mqtt
 import argparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--mqtt-ip", default="127.0.0.1", help="MQTT Broker IP")
+def load_env_mqtt_ip():
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VITE_MQTT_BROKER_IP="):
+                    return line.split("=", 1)[1].strip()
+    return "127.0.0.1"
+
+parser = argparse.ArgumentParser(description="P2026 Ground Station Monitor")
+parser.add_argument("--mqtt-ip", default=None, help="MQTT Broker IP")
 args = parser.parse_args()
 
-# --- MQTT 設定 ---
-MQTT_BROKER = args.mqtt_ip
+if args.mqtt_ip:
+    MQTT_BROKER = args.mqtt_ip
+else:
+    default_ip = load_env_mqtt_ip()
+    try:
+        user_input = input(f"請輸入目標 MQTT 伺服器 IP (直接 Enter 則預設為 {default_ip}): ").strip()
+        MQTT_BROKER = user_input if user_input else default_ip
+    except (EOFError, KeyboardInterrupt):
+        MQTT_BROKER = default_ip
+        print()
 MQTT_PORT = 1883
 TOPIC_TELEMETRY = "fc/telemetry"
 TOPIC_CMD = "fc/cmd"

@@ -29,10 +29,17 @@ def main():
     print("✨ Starting Ground Station Fullstack...")
     print("=======================================\n")
     
-    mqtt_ip = input("請輸入目標 MQTT 伺服器 IP (直接 Enter 則預設為 127.0.0.1 本機): ").strip()
-    if not mqtt_ip:
-        mqtt_ip = "127.0.0.1"
-        
+    # 讀取 .env 設定檔中的 VITE_MQTT_BROKER_IP
+    mqtt_ip = "127.0.0.1"
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VITE_MQTT_BROKER_IP="):
+                    mqtt_ip = line.split("=", 1)[1].strip()
+                    break
+
+    print(f"🔧 Loaded MQTT Broker IP from .env: {mqtt_ip}")
     is_local = (mqtt_ip == "127.0.0.1" or mqtt_ip == "localhost")
     
     mqtt_process = None
